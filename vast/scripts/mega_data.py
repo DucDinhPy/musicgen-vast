@@ -24,8 +24,8 @@ Examples:
   
     python ./vast/scripts/mega_data.py download \
     --mode public \
-    --url "https://mega.nz/folder/cCIVzKAB#UUB9yUcyT-bLOZskOLzXBQ" \
-    --local-dir /workspace/data
+    --url "https://mega.nz/folder/AP4EEJgb#eT7FyvuFVFcfxJo6iwcHsw" \
+    --local-dir /workspace/musicgen/data
 
   python mega_cli.py download --mode account --remote-dir /Root/data --local-dir /workspace/data
 
