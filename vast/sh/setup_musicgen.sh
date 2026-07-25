@@ -40,6 +40,7 @@ VENV_DIR="${VENV_DIR:-$WORK/.venv-musicgen}"
 
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
 NUMPY_VERSION="${NUMPY_VERSION:-1.26.4}"
+SCIPY_VERSION="${SCIPY_VERSION:-1.12.0}"
 AUDIOCRAFT_VERSION="${AUDIOCRAFT_VERSION:-1.3.0}"
 
 HF_HOME="${HF_HOME:-$WORK/hf_cache}"
@@ -64,6 +65,8 @@ log "    WORK:            $WORK"
 log "    PROJECT_DIR:     $PROJECT_DIR"
 log "    VENV_DIR:        $VENV_DIR"
 log "    TORCH_INDEX_URL: $TORCH_INDEX_URL"
+log "    NUMPY_VERSION:   $NUMPY_VERSION"
+log "    SCIPY_VERSION:   $SCIPY_VERSION"
 log "    HF_HOME:         $HF_HOME"
 log "    MUSICGEN_MODEL:  $MUSICGEN_MODEL"
 log "    PRELOAD_MODEL:   $PRELOAD_MODEL"
@@ -135,7 +138,7 @@ python -m pip install --upgrade \
     num2words \
     omegaconf \
     safetensors \
-    scipy \
+    "scipy==$SCIPY_VERSION" \
     sentencepiece \
     soundfile \
     spacy \
@@ -148,9 +151,12 @@ python -m pip install --upgrade \
 # AudioCraft imports xformers directly. Do not let xformers downgrade torch.
 python -m pip install --upgrade --no-deps xformers
 
-# Pin NumPy after all dependency installs, because some packages may upgrade it.
-# Torch/AudioCraft on this stack can report "Numpy is not available" with NumPy 2.x.
-python -m pip install --force-reinstall "numpy==$NUMPY_VERSION"
+# Pin NumPy/SciPy after all dependency installs, because some packages may
+# upgrade them. Torch/AudioCraft can report "Numpy is not available" with
+# NumPy 2.x, while newer SciPy builds may require NumPy 2.x.
+python -m pip install --force-reinstall \
+    "numpy==$NUMPY_VERSION" \
+    "scipy==$SCIPY_VERSION"
 
 
 log "==> [5/6] Persist Hugging Face cache environment"
