@@ -115,9 +115,6 @@ python -m pip install --upgrade --force-reinstall \
     torch torchvision torchaudio \
     --index-url "$TORCH_INDEX_URL"
 
-# Torch 2.x + some AudioCraft deps can break with NumPy 2.x.
-python -m pip install --force-reinstall "numpy==$NUMPY_VERSION"
-
 # Install AudioCraft without dependency resolution so it cannot force torch 2.1.
 python -m pip install --no-deps "audiocraft==$AUDIOCRAFT_VERSION"
 
@@ -141,6 +138,7 @@ python -m pip install --upgrade \
     scipy \
     sentencepiece \
     soundfile \
+    spacy \
     submitit \
     torchmetrics \
     tqdm \
@@ -149,6 +147,10 @@ python -m pip install --upgrade \
 
 # AudioCraft imports xformers directly. Do not let xformers downgrade torch.
 python -m pip install --upgrade --no-deps xformers
+
+# Pin NumPy after all dependency installs, because some packages may upgrade it.
+# Torch/AudioCraft on this stack can report "Numpy is not available" with NumPy 2.x.
+python -m pip install --force-reinstall "numpy==$NUMPY_VERSION"
 
 
 log "==> [5/6] Persist Hugging Face cache environment"
