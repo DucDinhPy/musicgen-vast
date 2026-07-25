@@ -21,14 +21,14 @@ MEGA_DOWNLOAD_REMOTE_DIR="${MEGA_DOWNLOAD_REMOTE_DIR:-/Root/vinahouse_audio}"
 echo "==> [1/3] Validate config"
 
 case "$DOWNLOAD_MODE" in
-    public
+    public)
         if [ -z "$MEGA_DATA_URL" ]; then
             echo "[error] DOWNLOAD_MODE=public requires MEGA_DATA_URL."
             exit 1
         fi
         ;;
 
-    account
+    account)
         if [ -z "$MEGA_EMAIL" ] || [ -z "$MEGA_PASSWORD" ]; then
             echo "[error] DOWNLOAD_MODE=account requires:"
             echo "        MEGA_EMAIL and MEGA_PASSWORD"
@@ -36,7 +36,7 @@ case "$DOWNLOAD_MODE" in
         fi
         ;;
 
-    *
+    *)
         echo "[error] Invalid DOWNLOAD_MODE: $DOWNLOAD_MODE"
         echo "        Valid values: public or account"
         exit 1
