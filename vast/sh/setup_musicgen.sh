@@ -108,11 +108,9 @@ python -m pip install --upgrade pip setuptools wheel
 
 
 log "==> [4/6] Install MusicGen / AudioCraft Python stack"
-# AudioCraft 1.3.0 metadata pins torch 2.1.0. Install AudioCraft first, then
-# override torch/torchaudio/torchvision with the selected CUDA wheel for fresh
-# Vast instances and newer GPUs.
-python -m pip install "audiocraft==$AUDIOCRAFT_VERSION"
-
+# Install modern torch first. AudioCraft 1.3.0 metadata pins torch 2.1.0, but
+# that wheel is not available for newer Python versions and is too old for some
+# fresh Vast/Blackwell instances.
 python -m pip install --upgrade --force-reinstall \
     torch torchvision torchaudio \
     --index-url "$TORCH_INDEX_URL"
@@ -120,17 +118,37 @@ python -m pip install --upgrade --force-reinstall \
 # Torch 2.x + some AudioCraft deps can break with NumPy 2.x.
 python -m pip install --force-reinstall "numpy==$NUMPY_VERSION"
 
-# AudioCraft imports xformers directly. Do not let xformers downgrade torch.
-python -m pip install --upgrade --no-deps xformers
+# Install AudioCraft without dependency resolution so it cannot force torch 2.1.
+python -m pip install --no-deps "audiocraft==$AUDIOCRAFT_VERSION"
 
+# Runtime deps needed for MusicGen inference. Keep torch-family packages managed
+# above; do not let old AudioCraft metadata downgrade them.
 python -m pip install --upgrade \
+    av==11.0.0 \
     accelerate \
+    demucs \
+    einops \
+    encodec \
+    flashy \
+    huggingface_hub \
+    hydra-colorlog \
+    hydra-core \
+    julius \
     librosa \
+    num2words \
+    omegaconf \
     safetensors \
     scipy \
     sentencepiece \
     soundfile \
-    transformers
+    submitit \
+    torchmetrics \
+    tqdm \
+    transformers \
+    treetable
+
+# AudioCraft imports xformers directly. Do not let xformers downgrade torch.
+python -m pip install --upgrade --no-deps xformers
 
 
 log "==> [5/6] Persist Hugging Face cache environment"
