@@ -15,7 +15,7 @@ download:
 
 upload:
   --work
-  --local-dir
+  --local-dir  # file or folder
   --destination-dir
   --email
   --password
@@ -30,6 +30,11 @@ Examples:
   python mega_cli.py download --mode account --remote-dir /Root/data --local-dir /workspace/data
 
   python mega_cli.py upload --local-dir /workspace/data --destination-dir /Root/data
+  python mega_cli.py upload --local-dir /workspace/file.wav --destination-dir /Root/data
+
+  python ./vast/scripts/mega_data.py upload \
+    --local-dir /workspace/musicgen_outputs/melody_large_test_pcm16.wav \
+    --destination-dir /Root/musicgen_outputs
 
 Prefer setting credentials through environment variables:
   export MEGA_EMAIL="user@example.com"
@@ -144,7 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     upload = subparsers.add_parser(
         "upload",
-        help="Upload folder local/Vast lên MEGA.",
+        help="Upload file/folder local/Vast lên MEGA.",
     )
     upload.add_argument(
         "--work",
@@ -155,7 +160,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--local-dir",
         type=Path,
         default=None,
-        help="Override UPLOAD_DATA_DIR.",
+        help="Override UPLOAD_DATA_DIR. Can be a file or folder.",
     )
     upload.add_argument(
         "--destination-dir",

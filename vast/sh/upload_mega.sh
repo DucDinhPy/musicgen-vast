@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # ============================ CONFIG =========================================
 WORK="${WORK:-/workspace}"
 
-# Thư mục local trên Vast.ai cần upload.
+# File hoặc thư mục local trên Vast.ai cần upload.
 UPLOAD_DATA_DIR="${UPLOAD_DATA_DIR:-$WORK/datasets/vinahouse/mega_audio}"
 
 # Thư mục đích trong tài khoản MEGA.
@@ -46,8 +46,8 @@ log "==> [1/4] Validate configuration"
 [[ -n "$DESTINATION_DIR" ]] ||
     error_exit "DESTINATION_DIR must not be empty."
 
-[[ -d "$UPLOAD_DATA_DIR" ]] ||
-    error_exit "Upload directory does not exist: $UPLOAD_DATA_DIR"
+[[ -e "$UPLOAD_DATA_DIR" ]] ||
+    error_exit "Upload path does not exist: $UPLOAD_DATA_DIR"
 
 log "    Upload source: $UPLOAD_DATA_DIR"
 log "    Destination:   $DESTINATION_DIR"
@@ -101,7 +101,7 @@ mega-whoami
 mega-mkdir -p "$DESTINATION_DIR" >/dev/null 2>&1 || true
 
 
-log "==> [4/4] Upload dataset"
+log "==> [4/4] Upload file/folder"
 
 mega-put \
     -- \
@@ -111,5 +111,5 @@ mega-put \
 
 log ""
 log "[done] Upload completed."
-log "Local folder: $UPLOAD_DATA_DIR"
+log "Local path:  $UPLOAD_DATA_DIR"
 log "MEGA folder:  $DESTINATION_DIR"
