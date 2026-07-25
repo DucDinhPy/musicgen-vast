@@ -21,7 +21,11 @@ upload:
   --password
 
 Examples:
-  python mega_cli.py download --mode public --url "<MEGA_URL>" --local-dir /workspace/data
+  
+    python ./vast/scripts/mega_data.py download \
+    --mode public \
+    --url "https://mega.nz/folder/cCIVzKAB#UUB9yUcyT-bLOZskOLzXBQ" \
+    --local-dir /workspace/data
 
   python mega_cli.py download --mode account --remote-dir /Root/data --local-dir /workspace/data
 
