@@ -20,6 +20,14 @@ class Track:
     title: str
 
 
+SOURCE_SET_TITLES = [
+    "NHẠC REMIX TIKTOK TRIỆU VIEW - BXH Nhạc Trẻ Remix Hay Nhất Hiện Nay - Top 20 Nhạc Hot TikTok 2026",
+    "NHẠC REMIX TIKTOK TRIỆU VIEW - BXH Nhạc Trẻ Remix Hay Nhất Hiện Nay - Top 20 Nhạc TikTok Hay 2026",
+    "NHẠC REMIX TIKTOK TRIỆU VIEW - BXH Nhạc Trẻ Remix Hay Nhất Hiện NayTop 20 Nhạc TikTok Hay 2026",
+    "TOP 30 NHẠC REMIX TIKTOK TRIỆU VIEW 2024 Vở Kịch Của Em Thu Cuối Lao Tâm Khổ Tứ Nguyệt Hồng Phai",
+]
+
+
 TRACKLISTS: list[list[Track]] = [
     [
         Track("00:00:00", "Sau Này Em Cưới Ai Rồi - Kiều Chi x Orinn Mix"),
@@ -122,11 +130,12 @@ def cut_all_sets(
     if ffmpeg is None:
         raise RuntimeError("Missing ffmpeg. Install it before running this script.")
 
-    sources = input_files or _discover_audio_files(input_dir)
+    sources = input_files or _discover_audio_files_by_expected_names(input_dir)
     if len(sources) != len(TRACKLISTS):
         raise RuntimeError(
             f"Expected {len(TRACKLISTS)} source audio files, got {len(sources)}. "
-            "Use --input-file four times to force the mapping/order."
+            "Make sure filenames match the expected set titles, or use "
+            "--input-file four times to force the mapping."
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -188,6 +197,42 @@ def cut_all_sets(
     print(f"Done. Manifest: {manifest_path}")
 
 
+def _discover_audio_files_by_expected_names(input_dir: Path) -> list[Path]:
+    audio_files = _discover_audio_files(input_dir)
+    matched: list[Path] = []
+    used: set[Path] = set()
+
+    for set_index, expected_title in enumerate(SOURCE_SET_TITLES, start=1):
+        expected_slug = _slugify(expected_title)
+        candidates = [
+            path
+            for path in audio_files
+            if path not in used and _filename_matches_expected(path, expected_slug)
+        ]
+
+        if len(candidates) != 1:
+            print("")
+            print(f"[error] Could not uniquely match source set {set_index:02d}")
+            print(f"Expected title: {expected_title}")
+            print(f"Expected slug:  {expected_slug}")
+            print("Candidates:")
+            for path in candidates:
+                print(f"  - {path.name}")
+            print("")
+            print("Available audio files:")
+            for path in audio_files:
+                print(f"  - {path.name}")
+            raise RuntimeError(
+                "Filename matching failed. Rename the source file to match the "
+                "tracklist title, or pass --input-file four times in the desired order."
+            )
+
+        matched.append(candidates[0])
+        used.add(candidates[0])
+
+    return matched
+
+
 def _discover_audio_files(input_dir: Path) -> list[Path]:
     if not input_dir.exists():
         raise FileNotFoundError(f"Input folder does not exist: {input_dir}")
@@ -199,6 +244,11 @@ def _discover_audio_files(input_dir: Path) -> list[Path]:
         for path in sorted(input_dir.iterdir())
         if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS
     ]
+
+
+def _filename_matches_expected(path: Path, expected_slug: str) -> bool:
+    file_slug = _slugify(path.stem)
+    return file_slug == expected_slug or expected_slug in file_slug
 
 
 def _cut_audio(
@@ -277,8 +327,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=None,
         help=(
-            "Explicit source file mapping. Pass exactly four times if sorted "
-            "input-dir order is not the desired tracklist order."
+            "Explicit source file mapping. Pass exactly four times to override "
+            "filename-based matching."
         ),
     )
     parser.add_argument(
