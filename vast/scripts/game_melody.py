@@ -47,6 +47,7 @@ DEFAULT_FORMATS = "mid,txt,csv"
 def cmd_check(args: argparse.Namespace) -> None:
     game_dir = args.game_dir
     infer_script = game_dir / "infer.py"
+    resolved_model_path = args.model_path.resolve() if args.model_path else None
 
     print("python:", sys.executable)
     print("game_dir:", game_dir)
@@ -54,6 +55,7 @@ def cmd_check(args: argparse.Namespace) -> None:
     print("infer.py exists:", infer_script.exists())
     print("model_path:", args.model_path)
     print("model exists:", args.model_path.exists() if args.model_path else False)
+    print("resolved model_path:", resolved_model_path)
 
 
 def cmd_extract(args: argparse.Namespace) -> None:
@@ -73,6 +75,7 @@ def cmd_extract(args: argparse.Namespace) -> None:
         model_path=model_path,
         dry_run=args.dry_run,
     )
+    model_path = model_path.resolve()
 
     vocal_files = _discover_vocals(stems_dir, args.input_stem)
     vocal_files = vocal_files[args.start_index :]

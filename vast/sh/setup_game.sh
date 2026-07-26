@@ -70,6 +70,8 @@ apt-get install -y -qq \
     ca-certificates \
     curl \
     ffmpeg \
+    fluidsynth \
+    fluid-soundfont-gm \
     git \
     libsndfile1 \
     python3 \
