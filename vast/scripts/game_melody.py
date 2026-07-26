@@ -99,6 +99,7 @@ def cmd_extract(args: argparse.Namespace) -> None:
     print(f"Output formats:  {','.join(formats)}")
     print(f"Start index:     {args.start_index}")
     print(f"Limit:           {args.limit if args.limit is not None else '(none)'}")
+    print(f"Batch mode:      {not args.single_process}")
     print(f"Dry run:         {args.dry_run}")
     print(f"Report:          {report_path.resolve()}")
     print("")
@@ -108,6 +109,8 @@ def cmd_extract(args: argparse.Namespace) -> None:
     error_count = 0
 
     with report_path.open("w", encoding="utf-8") as report:
+        pending: list[dict[str, object]] = []
+
         for index, vocal_path in enumerate(vocal_files, start=1):
             target_dir = _target_dir(vocal_path, stems_dir, output_dir)
             target_files = {
@@ -135,11 +138,51 @@ def cmd_extract(args: argparse.Namespace) -> None:
                 print(f"[plan] {index}/{len(vocal_files)} {vocal_path} -> {target_dir}")
                 continue
 
+            pending.append(
+                {
+                    "index": index,
+                    "vocal_path": vocal_path,
+                    "target_dir": target_dir,
+                    "target_files": target_files,
+                    "row": row,
+                }
+            )
+
+        if args.single_process:
+            for item in pending:
+                try:
+                    written = _extract_one(
+                        vocal_path=item["vocal_path"],  # type: ignore[arg-type]
+                        target_dir=item["target_dir"],  # type: ignore[arg-type]
+                        target_files=item["target_files"],  # type: ignore[arg-type]
+                        infer_script=infer_script,
+                        model_path=model_path,
+                        output_formats=",".join(formats),
+                        output_basename=args.output_basename,
+                        python_bin=args.python_bin,
+                        game_extra_args=args.game_extra_args,
+                        overwrite=args.overwrite,
+                    )
+                except subprocess.CalledProcessError as exc:
+                    error_count += 1
+                    row = item["row"]  # type: ignore[assignment]
+                    row["status"] = "error"
+                    row["error"] = f"GAME failed with exit code {exc.returncode}"
+                    report.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    print(f"[error] {item['index']}/{len(vocal_files)} {item['vocal_path']}: {row['error']}")
+                    if not args.keep_going:
+                        raise
+                    continue
+
+                ok_count += 1
+                row = item["row"]  # type: ignore[assignment]
+                row["written"] = [str(path) for path in written]
+                report.write(json.dumps(row, ensure_ascii=False) + "\n")
+                print(f"[ok] {item['index']}/{len(vocal_files)} {Path(item['vocal_path']).name} -> {item['target_dir']}")
+        elif pending:
             try:
-                written = _extract_one(
-                    vocal_path=vocal_path,
-                    target_dir=target_dir,
-                    target_files=target_files,
+                _extract_batch(
+                    items=pending,
                     infer_script=infer_script,
                     model_path=model_path,
                     output_formats=",".join(formats),
@@ -149,19 +192,22 @@ def cmd_extract(args: argparse.Namespace) -> None:
                     overwrite=args.overwrite,
                 )
             except subprocess.CalledProcessError as exc:
-                error_count += 1
-                row["status"] = "error"
-                row["error"] = f"GAME failed with exit code {exc.returncode}"
-                report.write(json.dumps(row, ensure_ascii=False) + "\n")
-                print(f"[error] {index}/{len(vocal_files)} {vocal_path}: {row['error']}")
+                error_count += len(pending)
+                for item in pending:
+                    row = item["row"]  # type: ignore[assignment]
+                    row["status"] = "error"
+                    row["error"] = f"GAME batch failed with exit code {exc.returncode}"
+                    report.write(json.dumps(row, ensure_ascii=False) + "\n")
+                print(f"[error] GAME batch failed with exit code {exc.returncode}")
                 if not args.keep_going:
                     raise
-                continue
-
-            ok_count += 1
-            row["written"] = [str(path) for path in written]
-            report.write(json.dumps(row, ensure_ascii=False) + "\n")
-            print(f"[ok] {index}/{len(vocal_files)} {vocal_path.name} -> {target_dir}")
+            else:
+                for item in pending:
+                    ok_count += 1
+                    row = item["row"]  # type: ignore[assignment]
+                    row["written"] = [str(path) for path in item["written"]]  # type: ignore[index]
+                    report.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    print(f"[ok] {item['index']}/{len(vocal_files)} {Path(item['vocal_path']).name} -> {item['target_dir']}")
 
     print("")
     print("Done.")
@@ -261,6 +307,66 @@ def _extract_one(
             written.append(target_file)
 
     return written
+
+
+def _extract_batch(
+    items: list[dict[str, object]],
+    infer_script: Path,
+    model_path: Path,
+    output_formats: str,
+    output_basename: str,
+    python_bin: str,
+    game_extra_args: str,
+    overwrite: bool,
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="game_melody_batch_") as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+
+        for batch_index, item in enumerate(items, start=1):
+            staged_audio = temp_dir / f"{batch_index:05d}_{output_basename}.wav"
+            shutil.copy2(item["vocal_path"], staged_audio)  # type: ignore[arg-type]
+            item["staged_audio"] = staged_audio
+
+            target_dir = item["target_dir"]  # type: ignore[assignment]
+            target_dir.mkdir(parents=True, exist_ok=True)
+            if overwrite:
+                target_files = item["target_files"]  # type: ignore[assignment]
+                for target_file in target_files.values():
+                    if target_file.exists():
+                        target_file.unlink()
+
+        cmd = [
+            python_bin,
+            str(infer_script),
+            "extract",
+            str(temp_dir),
+            "-m",
+            str(model_path),
+            "--glob",
+            "*.wav",
+            "--output-formats",
+            output_formats,
+        ]
+        if game_extra_args:
+            cmd.extend(shlex.split(game_extra_args))
+
+        subprocess.run(cmd, cwd=str(infer_script.parent), check=True)
+
+        for item in items:
+            staged_audio = item["staged_audio"]  # type: ignore[assignment]
+            target_files = item["target_files"]  # type: ignore[assignment]
+            written: list[Path] = []
+
+            for fmt, target_file in target_files.items():
+                source_file = staged_audio.with_suffix(f".{fmt}")
+                if not source_file.exists():
+                    raise RuntimeError(
+                        f"GAME did not write expected {fmt} output: {source_file}"
+                    )
+                shutil.copy2(source_file, target_file)
+                written.append(target_file)
+
+            item["written"] = written
 
 
 def _parse_formats(value: str) -> list[str]:
@@ -372,6 +478,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-going",
         action="store_true",
         help="Continue after a GAME failure.",
+    )
+    extract.add_argument(
+        "--single-process",
+        action="store_true",
+        help="Run one GAME process per vocal file. Slower, but useful for debugging.",
     )
     extract.add_argument(
         "--dry-run",
