@@ -25,7 +25,7 @@ set -Eeuo pipefail
 #   GAME_DIR=/workspace/GAME
 #   MODELS_DIR=/workspace/models/game
 #   TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126
-#   MODEL_URL=https://.../model.pt
+#   MODEL_URL=https://github.com/openvpi/GAME/releases/download/v1.0.0/GAME-1.0-large.zip
 # =============================================================================
 
 WORK="${WORK:-/workspace}"
@@ -75,6 +75,7 @@ apt-get install -y -qq \
     python3 \
     python3-pip \
     python3-venv \
+    unzip \
     wget
 
 
@@ -109,8 +110,33 @@ python -m pip install --upgrade -r "$GAME_DIR/requirements.txt"
 
 log "==> [6/6] Optional model download and verification"
 if [ -n "$MODEL_URL" ]; then
-    curl -L "$MODEL_URL" -o "$MODELS_DIR/$MODEL_NAME"
-    log "Downloaded model to: $MODELS_DIR/$MODEL_NAME"
+    if [[ "$MODEL_URL" == *.zip ]]; then
+        ARCHIVE_PATH="$MODELS_DIR/$(basename "$MODEL_URL")"
+        curl -L "$MODEL_URL" -o "$ARCHIVE_PATH"
+        unzip -o "$ARCHIVE_PATH" -d "$MODELS_DIR"
+
+        MODEL_FILE="$(
+            python - "$MODELS_DIR" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+models = sorted(root.rglob("*.pt"))
+if not models:
+    raise SystemExit(f"No .pt model found under {root}")
+print(models[0])
+PY
+        )"
+        ln -sfn "$MODEL_FILE" "$MODELS_DIR/game.pt"
+        log "Downloaded archive: $ARCHIVE_PATH"
+        log "Selected model:     $MODEL_FILE"
+        log "Symlink:            $MODELS_DIR/game.pt"
+    else
+        curl -L "$MODEL_URL" -o "$MODELS_DIR/$MODEL_NAME"
+        ln -sfn "$MODELS_DIR/$MODEL_NAME" "$MODELS_DIR/game.pt"
+        log "Downloaded model to: $MODELS_DIR/$MODEL_NAME"
+        log "Symlink:             $MODELS_DIR/game.pt"
+    fi
 else
     log "No MODEL_URL provided."
     log "Download a GAME .pt checkpoint manually and place it under:"
