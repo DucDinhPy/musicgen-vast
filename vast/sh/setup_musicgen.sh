@@ -18,7 +18,7 @@ set -Eeuo pipefail
 #   7. Verifies imports and optionally preloads a MusicGen checkpoint.
 #
 # Usage:
-#   cd /workspace/musicgen
+#   cd /workspace/musicgen-vast
 #   bash vast/sh/setup_musicgen.sh
 #
 # Optional overrides:

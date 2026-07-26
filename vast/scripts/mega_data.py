@@ -25,7 +25,7 @@ Examples:
     python ./vast/scripts/mega_data.py download \
     --mode public \
     --url "https://mega.nz/folder/AP4EEJgb#eT7FyvuFVFcfxJo6iwcHsw" \
-    --local-dir /workspace/musicgen/data
+    --local-dir /workspace/musicgen-vast/data
 
   python mega_cli.py download --mode account --remote-dir /Root/data --local-dir /workspace/data
 
@@ -33,8 +33,8 @@ Examples:
   python mega_cli.py upload --local-dir /workspace/file.wav --destination-dir /Root/data
 
   python ./vast/scripts/mega_data.py upload \
-    --local-dir /workspace/musicgen_outputs/melody_large_test_pcm16.wav \
-    --destination-dir /Root/musicgen_outputs
+    --local-dir /workspace/musicgen-vast/outputs/stems \
+    --destination-dir /data/stems/stems_single
 
 Prefer setting credentials through environment variables:
   export MEGA_EMAIL="user@example.com"

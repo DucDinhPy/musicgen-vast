@@ -9,7 +9,7 @@ set -Eeuo pipefail
 #   Setup only BS-RoFormer source separation.
 #
 # Usage:
-#   cd /workspace/musicgen
+#   cd /workspace/musicgen-vast
 #   bash vast/sh/setup_bs_roformer.sh
 #
 # Optional overrides:

@@ -20,7 +20,7 @@ Recommended setup
 -----------------
 On a fresh Vast.ai instance, run:
 
-    cd /workspace/musicgen
+    cd /workspace/musicgen-vast
     bash vast/sh/setup_bs_roformer.sh
     source /workspace/.venv-bs-roformer/bin/activate
 
@@ -32,17 +32,17 @@ Verify the environment:
 
 Download the default 6-stem model:
 
-    python vast/scripts/bs_roformer.py download \\
+    python vast/scripts/bs_roformer.py download \
       --model roformer-model-bs-roformer-sw-by-jarredou
 
 Separate a folder
 -----------------
 Basic CUDA run:
 
-    python vast/scripts/bs_roformer.py separate \\
-      --input-dir /workspace/data/raw_audio \\
-      --output-dir /workspace/outputs/stems \\
-      --device cuda \\
+    python vast/scripts/bs_roformer.py separate \
+      --input-dir /workspace/musicgen-vast/data/preprocess/pre_audio_single \
+      --output-dir /workspace/musicgen-vast/outputs/stems \
+      --device cuda \
       --convert-to-wav
 
 Default organized output layout:

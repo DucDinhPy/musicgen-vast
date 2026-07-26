@@ -9,7 +9,7 @@ set -Eeuo pipefail
 #   vast/scripts/bs_roformer.py separate
 #
 # Usage:
-#   cd /workspace/musicgen
+#   cd /workspace/musicgen-vast
 #   bash vast/sh/run_bs_roformer.sh \
 #     --input-dir /workspace/data/raw_audio \
 #     --output-dir /workspace/outputs/stems \
