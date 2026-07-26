@@ -113,6 +113,12 @@ def organize_flat_stems(
 
 def _target_path(source: Path, output_dir: Path) -> Path:
     song_id, stem_name = _split_stem_name(source.stem)
+
+    grouped = _split_staged_set_track(song_id)
+    if grouped is not None:
+        source_group, clean_song_id = grouped
+        return output_dir / source_group / clean_song_id / f"{stem_name}.wav"
+
     song_base, chunk_id = _split_chunk(song_id)
 
     if chunk_id is not None:
@@ -133,6 +139,23 @@ def _split_chunk(song_id: str) -> tuple[str, int | None]:
     if not match:
         return song_id, None
     return match.group("song"), int(match.group("chunk"))
+
+
+def _split_staged_set_track(song_id: str) -> tuple[str, str] | None:
+    # Handles flat outputs created from staged files, e.g.
+    #   00001_set04_track01_vo_kich_cua_em_bass.wav
+    # should become:
+    #   set_04/set04_track01_vo_kich_cua_em/bass.wav
+    match = re.match(
+        r"^\d+_(?P<clean>set(?P<set_index>\d{2})_track\d+_.+)$",
+        song_id,
+    )
+    if not match:
+        return None
+
+    source_group = f"set_{int(match.group('set_index')):02d}"
+    clean_song_id = match.group("clean")
+    return source_group, clean_song_id
 
 
 def build_parser() -> argparse.ArgumentParser:
