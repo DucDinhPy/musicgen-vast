@@ -38,6 +38,7 @@ GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-8}"
 LR="${LR:-1e-6}"
 SAVE_EVERY="${SAVE_EVERY:-250}"
 VALID_EVERY="${VALID_EVERY:-100}"
+RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
 
 if [ ! -f "$VENV_DIR/bin/activate" ]; then
     echo "[error] Missing venv: $VENV_DIR"
@@ -47,6 +48,11 @@ fi
 
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
+
+EXTRA_ARGS=()
+if [ -n "$RESUME_CHECKPOINT" ]; then
+    EXTRA_ARGS+=(--resume-checkpoint "$RESUME_CHECKPOINT")
+fi
 
 python "$PROJECT_DIR/vast/scripts/train_musicgen_melody_paired.py" \
     --train-metadata "$TRAIN_METADATA" \
@@ -64,4 +70,5 @@ python "$PROJECT_DIR/vast/scripts/train_musicgen_melody_paired.py" \
     --valid-every "$VALID_EVERY" \
     --save-every "$SAVE_EVERY" \
     --amp \
+    "${EXTRA_ARGS[@]}" \
     "$@"

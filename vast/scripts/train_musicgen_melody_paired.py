@@ -46,6 +46,8 @@ def train(args: argparse.Namespace) -> None:
     trainable_names = _set_trainable(model.lm, args.trainable, args.last_n_layers)
     if args.trainable_dtype == "float32":
         _cast_trainable_params(model.lm, torch.float32)
+    if args.resume_checkpoint is not None:
+        _load_trainable_checkpoint(model.lm, args.resume_checkpoint, device)
     trainable_params = [
         param for param in model.lm.parameters() if param.requires_grad
     ]
@@ -374,6 +376,23 @@ def _save_checkpoint(
     print(f"[save] {path}")
 
 
+def _load_trainable_checkpoint(lm: torch.nn.Module, checkpoint: Path, device: torch.device) -> None:
+    try:
+        state = torch.load(str(checkpoint), map_location=device, weights_only=False)
+    except TypeError:
+        state = torch.load(str(checkpoint), map_location=device)
+
+    trainable = state.get("trainable")
+    if not isinstance(trainable, dict):
+        raise RuntimeError(f"Checkpoint has no trainable state: {checkpoint}")
+
+    missing, unexpected = lm.load_state_dict(trainable, strict=False)
+    print(f"Resumed checkpoint: {checkpoint}")
+    print(f"Partial keys:       {len(trainable)}")
+    print(f"Missing keys:       {len(missing)}")
+    print(f"Unexpected keys:    {len(unexpected)}")
+
+
 def _read_jsonl(path: Path) -> list[dict]:
     rows = []
     with path.open("r", encoding="utf-8") as handle:
@@ -403,6 +422,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--valid-metadata", type=Path, default=None)
     parser.add_argument("--dataset-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--resume-checkpoint", type=Path, default=None)
     parser.add_argument("--model", default="facebook/musicgen-melody-large")
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
