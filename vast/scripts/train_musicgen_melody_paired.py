@@ -43,7 +43,7 @@ def train(args: argparse.Namespace) -> None:
     model.lm.train()
 
     _freeze(model.compression_model)
-    trainable_names = _set_trainable(model.lm, args.trainable)
+    trainable_names = _set_trainable(model.lm, args.trainable, args.last_n_layers)
     trainable_params = [
         param for param in model.lm.parameters() if param.requires_grad
     ]
@@ -258,7 +258,7 @@ def _freeze(module: torch.nn.Module) -> None:
         param.requires_grad = False
 
 
-def _set_trainable(lm: torch.nn.Module, mode: str) -> list[str]:
+def _set_trainable(lm: torch.nn.Module, mode: str, last_n_layers: int) -> list[str]:
     for param in lm.parameters():
         param.requires_grad = False
 
@@ -275,6 +275,18 @@ def _set_trainable(lm: torch.nn.Module, mode: str) -> list[str]:
             raise RuntimeError("LM has no `linears` module list.")
         for param in lm.linears.parameters():
             param.requires_grad = True
+    elif mode == "last_layers":
+        if not hasattr(lm, "transformer") or not hasattr(lm.transformer, "layers"):
+            raise RuntimeError("LM transformer layers were not found.")
+        layers = lm.transformer.layers
+        if last_n_layers <= 0:
+            raise ValueError("--last-n-layers must be > 0 for last_layers mode.")
+        for layer in layers[-last_n_layers:]:
+            for param in layer.parameters():
+                param.requires_grad = True
+        if hasattr(lm, "linears"):
+            for param in lm.linears.parameters():
+                param.requires_grad = True
     else:
         raise ValueError(f"Unsupported trainable mode: {mode}")
 
@@ -343,7 +355,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model", default="facebook/musicgen-melody-large")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--trainable", choices=["output_linears", "linears", "all"], default="output_linears")
+    parser.add_argument(
+        "--trainable",
+        choices=["output_linears", "last_layers", "linears", "all"],
+        default="output_linears",
+    )
+    parser.add_argument(
+        "--last-n-layers",
+        type=int,
+        default=2,
+        help="Number of final transformer layers to train when --trainable last_layers.",
+    )
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=100)
     parser.add_argument("--max-train-rows", type=int, default=None)
