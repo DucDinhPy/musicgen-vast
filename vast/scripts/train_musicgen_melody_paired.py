@@ -70,14 +70,26 @@ def train(args: argparse.Namespace) -> None:
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        collate_fn=lambda batch: _collate(batch, model.sample_rate, model.audio_channels, convert_audio),
+        collate_fn=lambda batch: _collate(
+            batch,
+            model.sample_rate,
+            model.audio_channels,
+            args.audio_duration,
+            convert_audio,
+        ),
     )
     valid_loader = DataLoader(
         PairDataset(valid_rows, args.dataset_root),
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        collate_fn=lambda batch: _collate(batch, model.sample_rate, model.audio_channels, convert_audio),
+        collate_fn=lambda batch: _collate(
+            batch,
+            model.sample_rate,
+            model.audio_channels,
+            args.audio_duration,
+            convert_audio,
+        ),
     ) if valid_rows else None
 
     optimizer = torch.optim.AdamW(
@@ -190,7 +202,13 @@ class PairDataset(Dataset):
         }
 
 
-def _collate(batch: list[dict], sample_rate: int, channels: int, convert_audio_fn) -> dict:
+def _collate(
+    batch: list[dict],
+    sample_rate: int,
+    channels: int,
+    audio_duration: float,
+    convert_audio_fn,
+) -> dict:
     import soundfile as sf
 
     melodies = []
@@ -204,6 +222,9 @@ def _collate(batch: list[dict], sample_rate: int, channels: int, convert_audio_f
 
         melody = convert_audio_fn(melody, melody_sr, sample_rate, channels)
         target = convert_audio_fn(target, target_sr, sample_rate, channels)
+        target_frames = int(audio_duration * sample_rate)
+        melody = _pad_or_trim(melody, target_frames)
+        target = _pad_or_trim(target, target_frames)
 
         melodies.append(melody)
         targets.append(target)
@@ -213,6 +234,16 @@ def _collate(batch: list[dict], sample_rate: int, channels: int, convert_audio_f
     melodies = torch.stack(melodies, dim=0)
     targets = torch.stack(targets, dim=0)
     return {"melodies": melodies, "targets": targets, "texts": texts, "meta": meta}
+
+
+def _pad_or_trim(audio: torch.Tensor, target_frames: int) -> torch.Tensor:
+    current_frames = audio.shape[-1]
+    if current_frames == target_frames:
+        return audio
+    if current_frames > target_frames:
+        return audio[..., :target_frames]
+    pad = target_frames - current_frames
+    return F.pad(audio, (0, pad))
 
 
 def _load_wav(path: Path, sf_module) -> tuple[torch.Tensor, int]:
@@ -396,6 +427,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-train-rows", type=int, default=None)
     parser.add_argument("--max-valid-rows", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--audio-duration",
+        type=float,
+        default=30.0,
+        help="Pad/trim all audio chunks to this duration in seconds. Default: 30.",
+    )
     parser.add_argument("--grad-accum-steps", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-5)
