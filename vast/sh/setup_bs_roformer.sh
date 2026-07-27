@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # Optional overrides:
 #   WORK=/workspace
 #   VENV_DIR=/workspace/.venv-bs-roformer
-#   TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
+#   TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126
 #   BS_ROFORMER_MODEL=roformer-model-bs-roformer-sw-by-jarredou
 #   PRELOAD_MODEL=true
 # =============================================================================
@@ -26,7 +26,7 @@ PROJECT_DIR="${PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 VENV_DIR="${VENV_DIR:-$WORK/.venv-bs-roformer}"
-TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
+TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu126}"
 NUMPY_VERSION="${NUMPY_VERSION:-1.26.4}"
 BS_ROFORMER_MODEL="${BS_ROFORMER_MODEL:-roformer-model-bs-roformer-sw-by-jarredou}"
 PRELOAD_MODEL="${PRELOAD_MODEL:-true}"
@@ -86,6 +86,12 @@ python -m pip install --upgrade \
     bs-roformer-infer \
     soundfile \
     tqdm
+
+# Keep CUDA torch pinned after dependency installs. Some packages may otherwise
+# pull a torch build that is too new for the current Vast.ai driver.
+python -m pip install --upgrade --force-reinstall \
+    torch torchaudio \
+    --index-url "$TORCH_INDEX_URL"
 
 log "==> [5/5] Verify installation"
 python - <<'PY'

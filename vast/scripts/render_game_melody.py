@@ -21,10 +21,9 @@ Output layout:
 Example:
 
     cd /workspace/musicgen-vast
-    python vast/scripts/render_game_melody.py \\
-      --input-dir /workspace/musicgen-vast/data/melody/game \\
-      --output-dir /workspace/musicgen-vast/data/melody/rendered \\
-      --limit 5
+    python vast/scripts/render_game_melody.py \
+      --input-dir /workspace/musicgen-vast/data/melody/game \
+      --output-dir /workspace/musicgen-vast/data/melody/rendered \
 """
 from __future__ import annotations
 

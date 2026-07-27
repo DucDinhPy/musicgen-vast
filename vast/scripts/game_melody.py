@@ -8,6 +8,13 @@ This wrapper is intentionally project-focused:
 2. Run OpenVPI GAME `infer.py extract` for each vocal file.
 3. Store clean outputs under a parallel melody folder.
 
+
+cd /workspace/musicgen-vast
+
+MODEL_URL=https://github.com/openvpi/GAME/releases/download/v1.0.0/GAME-1.0-large.zip \
+bash vast/sh/setup_game.sh
+
+
 Example:
 
     cd /workspace/musicgen-vast
