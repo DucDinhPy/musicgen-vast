@@ -33,7 +33,7 @@ Examples:
   python mega_cli.py upload --local-dir /workspace/file.wav --destination-dir /Root/data
 
   python ./vast/scripts/mega_data.py upload \
-    --local-dir /workspace/musicgen-vast/data/stems \
+    --local-dir /workspace/musicgen-vast/data \
     --destination-dir /data
 
 Prefer setting credentials through environment variables:
