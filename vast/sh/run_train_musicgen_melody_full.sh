@@ -33,6 +33,7 @@ DEVICE="${DEVICE:-cuda}"
 TRAINABLE="${TRAINABLE:-last_layers}"
 LAST_N_LAYERS="${LAST_N_LAYERS:-2}"
 MAX_STEPS="${MAX_STEPS:-2000}"
+EPOCHS="${EPOCHS:-1}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-8}"
 LR="${LR:-1e-6}"
@@ -63,6 +64,7 @@ python "$PROJECT_DIR/vast/scripts/train_musicgen_melody_paired.py" \
     --device "$DEVICE" \
     --trainable "$TRAINABLE" \
     --last-n-layers "$LAST_N_LAYERS" \
+    --epochs "$EPOCHS" \
     --max-steps "$MAX_STEPS" \
     --batch-size "$BATCH_SIZE" \
     --grad-accum-steps "$GRAD_ACCUM_STEPS" \
