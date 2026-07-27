@@ -134,7 +134,11 @@ def prepare_dataset(
                 melody_duration = _ffprobe_duration(melody_path)
 
                 for stem in target_stems:
-                    target_stem_path = stems_dir / rel_track / f"{stem}.wav"
+                    target_stem_path = _resolve_target_stem_path(
+                        stems_dir=stems_dir,
+                        rel_track=rel_track,
+                        stem=stem,
+                    )
                     if not target_stem_path.exists():
                         skip_count += 1
                         row = {
@@ -279,6 +283,23 @@ def _validate_dir(path: Path, label: str) -> None:
         raise FileNotFoundError(f"{label} folder does not exist: {path}")
     if not path.is_dir():
         raise NotADirectoryError(f"{label} path must be a folder: {path}")
+
+
+def _resolve_target_stem_path(stems_dir: Path, rel_track: Path, stem: str) -> Path:
+    direct = stems_dir / rel_track / f"{stem}.wav"
+    if direct.exists():
+        return direct
+
+    # `pre_audio_single` melody renders may be stored directly under
+    # data/melody/rendered/<song_id>/melody_piano.wav, while normalized stems
+    # preserve the source group:
+    # data/stems/.../pre_audio_single/<song_id>/instrumental.wav.
+    if len(rel_track.parts) == 1:
+        single = stems_dir / "pre_audio_single" / rel_track / f"{stem}.wav"
+        if single.exists():
+            return single
+
+    return direct
 
 
 def _ffprobe_duration(path: Path) -> float:
