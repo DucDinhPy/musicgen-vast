@@ -31,9 +31,10 @@ def generate(args: argparse.Namespace) -> None:
 
     melody, sample_rate = _load_wav(melody_path, sf)
     melody = convert_audio(melody, sample_rate, model.sample_rate, model.audio_channels)
+    duration = _resolve_duration(args.duration, melody, model.sample_rate)
 
     model.set_generation_params(
-        duration=args.duration,
+        duration=duration,
         top_k=args.top_k,
         top_p=args.top_p,
         temperature=args.temperature,
@@ -42,7 +43,7 @@ def generate(args: argparse.Namespace) -> None:
 
     print(f"Melody:     {melody_path}")
     print(f"Prompt:     {prompt}")
-    print(f"Duration:   {args.duration}")
+    print(f"Duration:   {duration:.2f}")
     print(f"Output:     {args.output}")
 
     with torch.no_grad():
@@ -111,6 +112,12 @@ def _load_wav(path: Path, sf_module) -> tuple[torch.Tensor, int]:
     return tensor, int(sample_rate)
 
 
+def _resolve_duration(value: str, melody: torch.Tensor, sample_rate: int) -> float:
+    if value.lower() == "auto":
+        return melody.shape[-1] / sample_rate
+    return float(value)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Generate a test WAV from a paired MusicGen Melody checkpoint."
@@ -162,9 +169,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--duration",
-        type=float,
-        default=30.0,
-        help="Generation duration in seconds. Default: 30.",
+        default="30",
+        help="Generation duration in seconds, or 'auto' to match melody length. Default: 30.",
     )
     parser.add_argument(
         "--top-k",
