@@ -85,7 +85,14 @@ def train(args: argparse.Namespace) -> None:
         weight_decay=args.weight_decay,
     )
 
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
+    use_grad_scaler = (
+        args.amp
+        and device.type == "cuda"
+        and all(param.dtype != torch.float16 for param in trainable_params)
+    )
+    if args.amp and not use_grad_scaler:
+        print("GradScaler: disabled because trainable parameters are already FP16.")
+    scaler = torch.cuda.amp.GradScaler(enabled=use_grad_scaler)
     global_step = 0
     optimizer.zero_grad(set_to_none=True)
     start_time = time.time()
