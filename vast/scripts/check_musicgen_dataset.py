@@ -47,6 +47,10 @@ def check_dataset(
         try:
             input_audio = _resolve_audio_path(row["input_audio"], dataset_root)
             target_audio = _resolve_audio_path(row["target_audio"], dataset_root)
+            text_prompt = row.get("text", "")
+            if not isinstance(text_prompt, str) or not text_prompt.strip():
+                raise ValueError("Missing or empty text prompt")
+
             _check_exists(input_audio, "input_audio")
             _check_exists(target_audio, "target_audio")
 
