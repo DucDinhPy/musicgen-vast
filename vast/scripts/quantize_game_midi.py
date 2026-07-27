@@ -46,7 +46,7 @@ def quantize_game_midi(
 
     for index, row in enumerate(rows, start=1):
         track_id = row["track_id"]
-        src = midi_root / track_id / midi_name
+        src = _resolve_source(midi_root, track_id, midi_name)
         dst = output_root / track_id / midi_name
 
         if not src.exists():
@@ -111,6 +111,20 @@ def _quantize_midi(
 
 def _quantize_time(value: float, grid_seconds: float) -> float:
     return round(value / grid_seconds) * grid_seconds
+
+
+def _resolve_source(source_root: Path, track_id: str, file_name: str) -> Path:
+    direct = source_root / track_id / file_name
+    if direct.exists():
+        return direct
+
+    rel = Path(track_id)
+    if len(rel.parts) == 2 and rel.parts[0] == "pre_audio_single":
+        fallback = source_root / rel.parts[1] / file_name
+        if fallback.exists():
+            return fallback
+
+    return direct
 
 
 def _read_jsonl(path: Path) -> list[dict]:

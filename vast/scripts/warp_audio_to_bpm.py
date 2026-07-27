@@ -44,7 +44,7 @@ def warp_audio_to_bpm(
 
     for index, row in enumerate(rows, start=1):
         track_id = row["track_id"]
-        src = source_root / track_id / audio_name
+        src = _resolve_source(source_root, track_id, audio_name)
         dst = output_root / track_id / audio_name
 
         if not src.exists():
@@ -109,6 +109,20 @@ def _atempo_filters(factor: float) -> str:
         factor /= 2.0
     factors.append(factor)
     return ",".join(f"atempo={value:.8f}" for value in factors)
+
+
+def _resolve_source(source_root: Path, track_id: str, audio_name: str) -> Path:
+    direct = source_root / track_id / audio_name
+    if direct.exists():
+        return direct
+
+    rel = Path(track_id)
+    if len(rel.parts) == 2 and rel.parts[0] == "pre_audio_single":
+        fallback = source_root / rel.parts[1] / audio_name
+        if fallback.exists():
+            return fallback
+
+    return direct
 
 
 def _read_jsonl(path: Path) -> list[dict]:
