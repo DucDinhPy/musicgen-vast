@@ -44,6 +44,8 @@ def train(args: argparse.Namespace) -> None:
 
     _freeze(model.compression_model)
     trainable_names = _set_trainable(model.lm, args.trainable, args.last_n_layers)
+    if args.trainable_dtype == "float32":
+        _cast_trainable_params(model.lm, torch.float32)
     trainable_params = [
         param for param in model.lm.parameters() if param.requires_grad
     ]
@@ -107,6 +109,10 @@ def train(args: argparse.Namespace) -> None:
                 scaler=scaler,
                 amp=args.amp,
             )
+            if not torch.isfinite(loss):
+                raise RuntimeError(
+                    f"Non-finite training loss at step {global_step}: {loss.item()}"
+                )
             loss_for_backward = loss / args.grad_accum_steps
 
             if scaler.is_enabled():
@@ -304,6 +310,12 @@ def _set_trainable(lm: torch.nn.Module, mode: str, last_n_layers: int) -> list[s
     ]
 
 
+def _cast_trainable_params(lm: torch.nn.Module, dtype: torch.dtype) -> None:
+    for param in lm.parameters():
+        if param.requires_grad:
+            param.data = param.data.to(dtype=dtype)
+
+
 def _save_checkpoint(
     path: Path,
     model,
@@ -372,6 +384,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=2,
         help="Number of final transformer layers to train when --trainable last_layers.",
+    )
+    parser.add_argument(
+        "--trainable-dtype",
+        choices=["float32", "keep"],
+        default="float32",
+        help="Cast trainable params to this dtype. Default: float32 for stability.",
     )
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=100)
