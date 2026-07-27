@@ -91,7 +91,10 @@ def _resolve_path(value: str, root: Path) -> Path:
 
 
 def _load_partial_checkpoint(model, checkpoint: Path, device: torch.device) -> None:
-    state = torch.load(str(checkpoint), map_location=device)
+    try:
+        state = torch.load(str(checkpoint), map_location=device, weights_only=False)
+    except TypeError:
+        state = torch.load(str(checkpoint), map_location=device)
     trainable = state.get("trainable")
     if not isinstance(trainable, dict):
         raise RuntimeError(f"Checkpoint has no trainable state: {checkpoint}")
