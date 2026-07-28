@@ -84,10 +84,41 @@ def infer(args: argparse.Namespace) -> None:
     else:
         raise ValueError(f"Unsupported tempo mode: {args.tempo_mode}")
 
+    conditioning_audio = aligned_melody
+    arrangement_sections = None
+    if args.pre_beats > 0 or args.post_beats > 0:
+        conditioning_audio = work_dir / "arranged_condition.wav"
+        arrangement_bpm = _resolve_arrangement_bpm(float(bpm_row["bpm"]), args)
+        conditioning_audio, arrangement_sections = _apply_context_beats(
+            source=aligned_melody,
+            target=conditioning_audio,
+            bpm=arrangement_bpm,
+            first_downbeat=float(bpm_row["first_downbeat"]) if args.tempo_mode == "preserve" else 0.0,
+            pre_beats=args.pre_beats,
+            post_beats=args.post_beats,
+            sf_module=sf,
+            np_module=np,
+            subtype=args.subtype,
+            overwrite=args.overwrite,
+        )
+        _write_json(
+            args.output_dir / "arrangement_report.json",
+            {
+                "source_audio": str(aligned_melody),
+                "conditioning_audio": str(conditioning_audio),
+                "source_bpm": float(bpm_row["bpm"]),
+                "arrangement_bpm": arrangement_bpm,
+                "first_downbeat": float(bpm_row["first_downbeat"]),
+                "pre_beats": args.pre_beats,
+                "post_beats": args.post_beats,
+                "sections": arrangement_sections,
+            },
+        )
+
     chunk_seconds = args.bars_per_chunk * 4.0 * 60.0 / args.target_bpm
     hop_seconds = args.hop_bars * 4.0 * 60.0 / args.target_bpm
     starts = _chunk_starts(
-        duration=_duration(aligned_melody),
+        duration=_duration(conditioning_audio),
         chunk_seconds=chunk_seconds,
         hop_seconds=hop_seconds,
         include_partial_final=args.include_partial_final,
@@ -108,6 +139,7 @@ def infer(args: argparse.Namespace) -> None:
     print(f"First downbeat:    {float(bpm_row['first_downbeat']):.3f}s")
     print(f"Confidence:        {float(bpm_row['confidence']):.2f}")
     print(f"Aligned melody:    {aligned_melody.resolve()}")
+    print(f"Condition audio:   {conditioning_audio.resolve()}")
     print(f"Chunk seconds:     {chunk_seconds:.3f}")
     print(f"Chunks:            {len(starts)}")
     print(f"Output dir:        {args.output_dir.resolve()}")
@@ -123,22 +155,30 @@ def infer(args: argparse.Namespace) -> None:
     metadata_rows = []
 
     for chunk_index, start in enumerate(starts):
-        duration = min(chunk_seconds, _duration(aligned_melody) - start)
+        duration = min(chunk_seconds, _duration(conditioning_audio) - start)
         if duration <= 0:
             continue
 
         melody_chunk = chunks_dir / f"chunk_{chunk_index:04d}.wav"
         output_chunk = generated_dir / f"chunk_{chunk_index:04d}.wav"
-        _write_chunk(aligned_melody, melody_chunk, start, duration, args.sample_rate, args.overwrite)
+        _write_chunk(conditioning_audio, melody_chunk, start, duration, args.sample_rate, args.overwrite)
 
-        active = _detect_active_intervals(
-            melody_path=melody_chunk,
-            frame_seconds=args.frame_seconds,
-            threshold_db=args.threshold_db,
-            min_active_seconds=args.min_active_seconds,
-            merge_gap_seconds=args.merge_gap_seconds,
-        )
-        sections = _build_sections(active, duration)
+        if arrangement_sections:
+            sections = _sections_for_chunk(arrangement_sections, start, duration)
+            active = [
+                [section[1], section[2]]
+                for section in sections
+                if section[0] == "main_vocal_melody"
+            ]
+        else:
+            active = _detect_active_intervals(
+                melody_path=melody_chunk,
+                frame_seconds=args.frame_seconds,
+                threshold_db=args.threshold_db,
+                min_active_seconds=args.min_active_seconds,
+                merge_gap_seconds=args.merge_gap_seconds,
+            )
+            sections = _build_sections(active, duration)
         structure_text = _structure_text(sections)
         bpm_label = _resolve_bpm_label(
             row_bpm=float(bpm_row["bpm"]),
@@ -194,7 +234,7 @@ def infer(args: argparse.Namespace) -> None:
 
     if args.keep_aligned_melody:
         final_melody = args.output_dir / "aligned_melody_128.wav"
-        _copy_audio(aligned_melody, final_melody)
+        _copy_audio(conditioning_audio, final_melody)
         print(f"Aligned melody copy: {final_melody}")
 
     print("")
@@ -257,6 +297,83 @@ def _estimate_or_override_bpm(
         "needs_review": confidence < min_confidence,
         "source": "librosa",
     }
+
+
+def _resolve_arrangement_bpm(row_bpm: float, args: argparse.Namespace) -> float:
+    if args.arrangement_bpm is not None:
+        return float(args.arrangement_bpm)
+    if args.bpm_label_min is not None and args.bpm_label_max is not None:
+        return _fold_bpm_to_range(row_bpm, args.bpm_label_min, args.bpm_label_max)
+    return row_bpm
+
+
+def _apply_context_beats(
+    source: Path,
+    target: Path,
+    bpm: float,
+    first_downbeat: float,
+    pre_beats: float,
+    post_beats: float,
+    sf_module,
+    np_module,
+    subtype: str,
+    overwrite: bool,
+) -> tuple[Path, list[list]]:
+    if target.exists() and not overwrite:
+        duration = _duration(target)
+        pre_seconds = pre_beats * 60.0 / bpm
+        post_seconds = post_beats * 60.0 / bpm
+        return target, _arrangement_sections(duration, pre_seconds, post_seconds)
+
+    audio, sr = sf_module.read(str(source), dtype="float32", always_2d=True)
+    first_downbeat = max(0.0, min(float(first_downbeat), len(audio) / sr))
+    trim_start = int(round(first_downbeat * sr))
+    melody_audio = audio[trim_start:]
+
+    pre_seconds = pre_beats * 60.0 / bpm
+    post_seconds = post_beats * 60.0 / bpm
+    pre = np_module.zeros((int(round(pre_seconds * sr)), audio.shape[1]), dtype=audio.dtype)
+    post = np_module.zeros((int(round(post_seconds * sr)), audio.shape[1]), dtype=audio.dtype)
+    arranged = np_module.concatenate([pre, melody_audio, post], axis=0)
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    sf_module.write(str(target), arranged, sr, subtype=subtype)
+    sections = [
+        ["intro_no_melody", 0.0, round(pre_seconds, 3)],
+        ["main_vocal_melody", round(pre_seconds, 3), round(pre_seconds + len(melody_audio) / sr, 3)],
+        [
+            "outro_no_melody",
+            round(pre_seconds + len(melody_audio) / sr, 3),
+            round(pre_seconds + len(melody_audio) / sr + post_seconds, 3),
+        ],
+    ]
+    return target, sections
+
+
+def _arrangement_sections(duration: float, pre_seconds: float, post_seconds: float) -> list[list]:
+    main_start = pre_seconds
+    main_end = max(main_start, duration - post_seconds)
+    return [
+        ["intro_no_melody", 0.0, round(main_start, 3)],
+        ["main_vocal_melody", round(main_start, 3), round(main_end, 3)],
+        ["outro_no_melody", round(main_end, 3), round(duration, 3)],
+    ]
+
+
+def _sections_for_chunk(sections: list[list], chunk_start: float, chunk_duration: float) -> list[list]:
+    chunk_end = chunk_start + chunk_duration
+    local = []
+    for label, start, end in sections:
+        overlap_start = max(float(start), chunk_start)
+        overlap_end = min(float(end), chunk_end)
+        if overlap_end <= overlap_start:
+            continue
+        local.append([
+            label,
+            round(overlap_start - chunk_start, 3),
+            round(overlap_end - chunk_start, 3),
+        ])
+    return local
 
 
 def _prepare_melody_input(args: argparse.Namespace, work_dir: Path) -> Path:
@@ -801,6 +918,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional max BPM for folding labels, e.g. 150 for Vinahouse.",
     )
     parser.add_argument("--target-bpm", type=float, default=128.0)
+    parser.add_argument(
+        "--pre-beats",
+        type=float,
+        default=0.0,
+        help="Add this many silent beats before the detected/overridden first downbeat.",
+    )
+    parser.add_argument(
+        "--post-beats",
+        type=float,
+        default=0.0,
+        help="Add this many silent beats after the trimmed input audio.",
+    )
+    parser.add_argument(
+        "--arrangement-bpm",
+        type=float,
+        default=None,
+        help="Manual BPM used to convert pre/post beats to seconds. Default: detected/folded BPM.",
+    )
     parser.add_argument(
         "--tempo-mode",
         choices=("preserve", "warp_to_target"),
