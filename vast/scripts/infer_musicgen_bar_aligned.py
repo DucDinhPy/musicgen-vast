@@ -22,7 +22,7 @@ import torch
 
 
 DEFAULT_PROMPT = (
-    "generate a full clean energetic vinahouse instrumental backing track at 128 bpm, "
+    "generate a full clean energetic vinahouse instrumental backing track, "
     "punchy drums, rolling bass, bright synth chords, build ups and drops, no lead vocal"
 )
 
@@ -140,7 +140,14 @@ def infer(args: argparse.Namespace) -> None:
         )
         sections = _build_sections(active, duration)
         structure_text = _structure_text(sections)
-        prompt = _join_prompt(args.prompt, structure_text, args.disable_structure_prompt)
+        bpm_label = _resolve_bpm_label(
+            row_bpm=float(bpm_row["bpm"]),
+            target_bpm=args.target_bpm,
+            mode=args.prompt_bpm_mode,
+            label_min=args.bpm_label_min,
+            label_max=args.bpm_label_max,
+        )
+        prompt = _join_prompt(args.prompt, bpm_label, structure_text, args.disable_structure_prompt)
 
         model.set_generation_params(
             duration=duration,
@@ -253,7 +260,7 @@ def _estimate_or_override_bpm(
 
 
 def _prepare_melody_input(args: argparse.Namespace, work_dir: Path) -> Path:
-    if args.input_kind == "piano_melody":
+    if args.input_kind in {"direct_audio", "piano_melody"}:
         return args.input_audio
     if args.input_kind != "vocal":
         raise ValueError(f"Unsupported input kind: {args.input_kind}")
@@ -627,10 +634,51 @@ def _structure_text(sections: list[list]) -> str:
     return "structure: " + ", ".join(parts)
 
 
-def _join_prompt(base_prompt: str, structure_text: str, disable_structure_prompt: bool) -> str:
+def _resolve_bpm_label(
+    row_bpm: float,
+    target_bpm: float,
+    mode: str,
+    label_min: float | None,
+    label_max: float | None,
+) -> str | None:
+    if mode == "none":
+        return None
+    if mode == "target":
+        bpm = target_bpm
+    elif mode == "auto":
+        bpm = row_bpm
+    else:
+        raise ValueError(f"Unsupported prompt BPM mode: {mode}")
+
+    if label_min is not None and label_max is not None:
+        bpm = _fold_bpm_to_range(bpm, label_min, label_max)
+    return f"{bpm:.1f} bpm"
+
+
+def _fold_bpm_to_range(bpm: float, label_min: float, label_max: float) -> float:
+    if bpm <= 0:
+        return bpm
+    folded = bpm
+    while folded < label_min:
+        folded *= 2.0
+    while folded > label_max:
+        folded /= 2.0
+    return folded
+
+
+def _join_prompt(
+    base_prompt: str,
+    bpm_label: str | None,
+    structure_text: str,
+    disable_structure_prompt: bool,
+) -> str:
+    parts = [base_prompt] if base_prompt else []
+    if bpm_label:
+        parts.append(bpm_label)
     if disable_structure_prompt:
-        return base_prompt
-    return f"{base_prompt}, {structure_text}" if base_prompt else structure_text
+        return ", ".join(parts)
+    parts.append(structure_text)
+    return ", ".join(parts)
 
 
 def _to_db(value: float) -> float:
@@ -721,9 +769,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-audio", type=Path, required=True, help="Input audio.")
     parser.add_argument(
         "--input-kind",
-        choices=("piano_melody", "vocal"),
-        default="piano_melody",
-        help="Use piano_melody for an already rendered melody WAV, or vocal to run GAME->piano first.",
+        choices=("direct_audio", "piano_melody", "vocal"),
+        default="direct_audio",
+        help=(
+            "direct_audio uses the input as-is, piano_melody is an alias for direct_audio, "
+            "vocal runs GAME->piano first."
+        ),
     )
     parser.add_argument("--checkpoint", type=Path, default=None, help="Fine-tuned checkpoint_step_*.pt.")
     parser.add_argument("--output-dir", type=Path, required=True, help="Folder for chunks/reports.")
@@ -731,6 +782,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default="facebook/musicgen-melody-large")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
+    parser.add_argument(
+        "--prompt-bpm-mode",
+        choices=("auto", "target", "none"),
+        default="auto",
+        help="Append BPM label to prompt from detected BPM, target BPM, or not at all. Default: auto.",
+    )
+    parser.add_argument(
+        "--bpm-label-min",
+        type=float,
+        default=None,
+        help="Optional min BPM for folding labels, e.g. 120 for Vinahouse.",
+    )
+    parser.add_argument(
+        "--bpm-label-max",
+        type=float,
+        default=None,
+        help="Optional max BPM for folding labels, e.g. 150 for Vinahouse.",
+    )
     parser.add_argument("--target-bpm", type=float, default=128.0)
     parser.add_argument(
         "--tempo-mode",
