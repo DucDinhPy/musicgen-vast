@@ -60,16 +60,29 @@ def infer(args: argparse.Namespace) -> None:
     _write_json(args.output_dir / "bpm_report.json", bpm_row)
 
     aligned_melody = work_dir / "aligned_128" / "melody_piano.wav"
-    _warp_audio(
-        source=melody_input,
-        target=aligned_melody,
-        source_bpm=float(bpm_row["bpm"]),
-        target_bpm=args.target_bpm,
-        first_downbeat=float(bpm_row["first_downbeat"]),
-        sample_rate=args.sample_rate,
-        channels=1,
-        overwrite=args.overwrite,
-    )
+    if args.tempo_mode == "preserve":
+        _normalize_audio(
+            source=melody_input,
+            target=aligned_melody,
+            sample_rate=args.sample_rate,
+            channels=1,
+            overwrite=args.overwrite,
+        )
+    elif args.tempo_mode == "warp_to_target":
+        _warp_audio(
+            source=melody_input,
+            target=aligned_melody,
+            source_bpm=float(bpm_row["bpm"]),
+            target_bpm=args.target_bpm,
+            first_downbeat=float(bpm_row["first_downbeat"]),
+            sample_rate=args.sample_rate,
+            channels=1,
+            max_warp_factor=args.max_warp_factor,
+            allow_large_warp=args.allow_large_warp,
+            overwrite=args.overwrite,
+        )
+    else:
+        raise ValueError(f"Unsupported tempo mode: {args.tempo_mode}")
 
     chunk_seconds = args.bars_per_chunk * 4.0 * 60.0 / args.target_bpm
     hop_seconds = args.hop_bars * 4.0 * 60.0 / args.target_bpm
@@ -88,6 +101,7 @@ def infer(args: argparse.Namespace) -> None:
 
     print(f"Input audio:       {args.input_audio.resolve()}")
     print(f"Input kind:        {args.input_kind}")
+    print(f"Tempo mode:        {args.tempo_mode}")
     print(f"Melody input:      {melody_input.resolve()}")
     print(f"Checkpoint:        {args.checkpoint.resolve() if args.checkpoint else 'base model only'}")
     print(f"Detected BPM:      {float(bpm_row['bpm']):.2f}")
@@ -413,12 +427,22 @@ def _warp_audio(
     first_downbeat: float,
     sample_rate: int,
     channels: int,
+    max_warp_factor: float,
+    allow_large_warp: bool,
     overwrite: bool,
 ) -> None:
     if target.exists() and not overwrite:
         return
     target.parent.mkdir(parents=True, exist_ok=True)
-    filters = _atempo_filters(target_bpm / source_bpm)
+    warp_factor = target_bpm / source_bpm
+    if not allow_large_warp and (warp_factor > max_warp_factor or warp_factor < 1.0 / max_warp_factor):
+        raise RuntimeError(
+            f"Refusing large tempo warp: source_bpm={source_bpm:.2f}, "
+            f"target_bpm={target_bpm:.2f}, factor={warp_factor:.3f}. "
+            "Use --tempo-mode preserve for vocal-lock inference, or pass "
+            "--allow-large-warp if you intentionally want this."
+        )
+    filters = _atempo_filters(warp_factor)
     subprocess.run(
         [
             "ffmpeg",
@@ -432,6 +456,35 @@ def _warp_audio(
             str(source),
             "-af",
             filters,
+            "-ac",
+            str(channels),
+            "-ar",
+            str(sample_rate),
+            str(target),
+        ],
+        check=True,
+    )
+
+
+def _normalize_audio(
+    source: Path,
+    target: Path,
+    sample_rate: int,
+    channels: int,
+    overwrite: bool,
+) -> None:
+    if target.exists() and not overwrite:
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(source),
             "-ac",
             str(channels),
             "-ar",
@@ -679,6 +732,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--target-bpm", type=float, default=128.0)
+    parser.add_argument(
+        "--tempo-mode",
+        choices=("preserve", "warp_to_target"),
+        default="preserve",
+        help=(
+            "preserve keeps input timing/duration for vocal-lock inference. "
+            "warp_to_target trims first downbeat and time-stretches to target BPM."
+        ),
+    )
+    parser.add_argument(
+        "--max-warp-factor",
+        type=float,
+        default=1.12,
+        help="Safety limit for warp_to_target. Default allows about +/-12%% tempo change.",
+    )
+    parser.add_argument(
+        "--allow-large-warp",
+        action="store_true",
+        help="Allow aggressive tempo warps. Not recommended for raw vocal.",
+    )
     parser.add_argument("--source-bpm", type=float, default=None, help="Manual source BPM override.")
     parser.add_argument("--first-downbeat", type=float, default=None, help="Manual first downbeat seconds override.")
     parser.add_argument("--min-confidence", type=float, default=0.75)
