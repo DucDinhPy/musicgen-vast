@@ -41,6 +41,11 @@ def prepare_rhythm_conditions(
     bpm_min: float | None,
     bpm_max: float | None,
     pulse_width_seconds: float,
+    add_section_labels: bool,
+    section_frame_seconds: float,
+    section_threshold_db: float,
+    section_min_active_seconds: float,
+    section_merge_gap_seconds: float,
     limit: int | None,
     overwrite: bool,
 ) -> None:
@@ -95,7 +100,26 @@ def prepare_rhythm_conditions(
             updated["downbeat_count"] = len(rhythm["downbeats"])
             updated["rhythm_feature_rate"] = feature_rate
             updated["beats_per_bar"] = beats_per_bar
-            updated["text"] = _append_bpm_to_text(str(row.get("text", "")), float(rhythm["bpm"]))
+            structure_text = ""
+            if add_section_labels:
+                input_audio = _resolve_path(row["input_audio"], dataset_root)
+                sections = _build_section_labels(
+                    input_audio=input_audio,
+                    duration=duration,
+                    chunk_index=chunk_index,
+                    frame_seconds=section_frame_seconds,
+                    threshold_db=section_threshold_db,
+                    min_active_seconds=section_min_active_seconds,
+                    merge_gap_seconds=section_merge_gap_seconds,
+                )
+                structure_text = _structure_text(sections)
+                updated["sections"] = sections
+                updated["structure_text"] = structure_text
+            updated["text"] = _append_prompt_labels(
+                text=str(row.get("text", "")),
+                bpm=float(rhythm["bpm"]),
+                structure_text=structure_text,
+            )
             out.write(json.dumps(updated, ensure_ascii=False) + "\n")
 
             print(
@@ -216,6 +240,115 @@ def _load_npz_summary(path: Path) -> dict:
     }
 
 
+def _build_section_labels(
+    input_audio: Path,
+    duration: float,
+    chunk_index: int,
+    frame_seconds: float,
+    threshold_db: float,
+    min_active_seconds: float,
+    merge_gap_seconds: float,
+) -> list[list]:
+    active = _detect_active_intervals(
+        audio_path=input_audio,
+        frame_seconds=frame_seconds,
+        threshold_db=threshold_db,
+        min_active_seconds=min_active_seconds,
+        merge_gap_seconds=merge_gap_seconds,
+    )
+    if not active:
+        label = "intro_no_melody" if chunk_index == 0 else "break_or_drop_no_melody"
+        return [[label, 0.0, round(duration, 3)]]
+
+    sections: list[list] = []
+    cursor = 0.0
+    melody_seen = False
+    for start, end in active:
+        start = float(start)
+        end = min(float(end), duration)
+        if start > cursor + 0.25:
+            if not melody_seen and chunk_index == 0:
+                label = "intro_no_melody"
+            else:
+                label = "break_or_drop_no_melody"
+            sections.append([label, round(cursor, 3), round(start, 3)])
+
+        melody_label = "main_melody" if not melody_seen else "melody_backing"
+        sections.append([melody_label, round(start, 3), round(end, 3)])
+        melody_seen = True
+        cursor = end
+
+    if cursor < duration - 0.25:
+        sections.append(["outro_no_melody", round(cursor, 3), round(duration, 3)])
+    return sections
+
+
+def _detect_active_intervals(
+    audio_path: Path,
+    frame_seconds: float,
+    threshold_db: float,
+    min_active_seconds: float,
+    merge_gap_seconds: float,
+) -> list[list[float]]:
+    try:
+        import numpy as np
+        import soundfile as sf
+    except ImportError as exc:
+        raise RuntimeError("Missing dependency: numpy/soundfile.") from exc
+
+    audio, sr = sf.read(str(audio_path), dtype="float32", always_2d=False)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    frame_size = max(1, int(frame_seconds * sr))
+
+    active_frames = []
+    for start in range(0, len(audio), frame_size):
+        frame = audio[start:start + frame_size]
+        if frame.size == 0:
+            continue
+        rms = float(np.sqrt(np.mean(np.square(frame))))
+        if _to_db(rms) >= threshold_db:
+            active_frames.append((start / sr, min(len(audio), start + frame_size) / sr))
+
+    intervals = _merge_intervals(active_frames, merge_gap_seconds)
+    return [
+        [round(start, 3), round(end, 3)]
+        for start, end in intervals
+        if end - start >= min_active_seconds
+    ]
+
+
+def _merge_intervals(intervals: list[tuple[float, float]], merge_gap_seconds: float) -> list[tuple[float, float]]:
+    if not intervals:
+        return []
+    merged = [intervals[0]]
+    for start, end in intervals[1:]:
+        prev_start, prev_end = merged[-1]
+        if start - prev_end <= merge_gap_seconds:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _structure_text(sections: list[list]) -> str:
+    parts = [f"{label} {start:.1f}-{end:.1f}s" for label, start, end in sections]
+    return "structure: " + ", ".join(parts)
+
+
+def _to_db(value: float) -> float:
+    if value <= 0:
+        return -math.inf
+    return 20.0 * math.log10(value)
+
+
+def _append_prompt_labels(text: str, bpm: float, structure_text: str) -> str:
+    output = _append_bpm_to_text(text, bpm)
+    if structure_text:
+        output = f"{output}, {structure_text}" if output else structure_text
+    return output
+
+
 def _append_bpm_to_text(text: str, bpm: float) -> str:
     bpm_text = f"{bpm:.1f} bpm"
     if " bpm" in text.lower():
@@ -279,6 +412,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bpm-min", type=float, default=120.0)
     parser.add_argument("--bpm-max", type=float, default=150.0)
     parser.add_argument("--pulse-width-seconds", type=float, default=0.03)
+    parser.add_argument("--no-section-labels", dest="add_section_labels", action="store_false")
+    parser.set_defaults(add_section_labels=True)
+    parser.add_argument("--section-frame-seconds", type=float, default=0.25)
+    parser.add_argument("--section-threshold-db", type=float, default=-45.0)
+    parser.add_argument("--section-min-active-seconds", type=float, default=1.0)
+    parser.add_argument("--section-merge-gap-seconds", type=float, default=1.0)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
     return parser
@@ -296,6 +435,11 @@ def main() -> None:
         bpm_min=args.bpm_min,
         bpm_max=args.bpm_max,
         pulse_width_seconds=args.pulse_width_seconds,
+        add_section_labels=args.add_section_labels,
+        section_frame_seconds=args.section_frame_seconds,
+        section_threshold_db=args.section_threshold_db,
+        section_min_active_seconds=args.section_min_active_seconds,
+        section_merge_gap_seconds=args.section_merge_gap_seconds,
         limit=args.limit,
         overwrite=args.overwrite,
     )
