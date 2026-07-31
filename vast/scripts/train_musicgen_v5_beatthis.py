@@ -168,6 +168,9 @@ def train(args: argparse.Namespace) -> None:
     from audiocraft.models import MusicGen
 
     device = torch.device(args.device)
+    torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading model: {args.model}")
@@ -182,12 +185,18 @@ def train(args: argparse.Namespace) -> None:
     if args.trainable_dtype == "float32":
         _cast_trainable_params(model.lm, torch.float32)
 
-    print(f"Loading V1 base checkpoint: {args.base_v1_checkpoint}")
-    _load_v1_base_checkpoint(
-        lm=model.lm,
-        checkpoint=args.base_v1_checkpoint,
-        expected_model=args.model,
-    )
+    if args.init_from == "v1":
+        print(f"Loading V1 base checkpoint: {args.base_v1_checkpoint}")
+        _load_v1_base_checkpoint(
+            lm=model.lm,
+            checkpoint=args.base_v1_checkpoint,
+            expected_model=args.model,
+        )
+    else:
+        print(
+            "Initializing V5 directly from the original pretrained "
+            f"checkpoint: {args.model}"
+        )
 
     vocab_size = _infer_vocab_size(model)
     conditioner = BeatThisLogitConditioner(
@@ -203,6 +212,7 @@ def train(args: argparse.Namespace) -> None:
             lm=model.lm,
             conditioner=conditioner,
             checkpoint=args.resume_v5_checkpoint,
+            expected_initialization=args.init_from,
         )
 
     lm_trainable = [
@@ -229,6 +239,7 @@ def train(args: argparse.Namespace) -> None:
     print(f"LM trainable mode:       {args.trainable}")
     print(f"LM trainable tensors:    {len(trainable_names)}")
     print(f"LM trainable params:     {sum(p.numel() for p in lm_trainable):,}")
+    print(f"LM learning rate:        {args.lr}")
     print(f"Rhythm features:         {len(RHYTHM_FEATURE_NAMES)}")
     print(f"Rhythm hidden dim:       {args.rhythm_hidden_dim}")
     print(f"Rhythm feature rate:     {args.rhythm_feature_rate}")
@@ -236,6 +247,7 @@ def train(args: argparse.Namespace) -> None:
         f"Rhythm trainable params: "
         f"{sum(p.numel() for p in conditioner_trainable):,}"
     )
+    print(f"Rhythm learning rate:    {args.rhythm_lr}")
     print(f"Train rows:              {len(train_rows)}")
     print(f"Valid rows:              {len(valid_rows)}")
     print(f"Resumed V5 step:         {resumed_step}")
@@ -259,8 +271,10 @@ def train(args: argparse.Namespace) -> None:
     )
 
     optimizer = torch.optim.AdamW(
-        trainable_params,
-        lr=args.lr,
+        [
+            {"params": lm_trainable, "lr": args.lr},
+            {"params": conditioner_trainable, "lr": args.rhythm_lr},
+        ],
         betas=(0.9, 0.95),
         weight_decay=args.weight_decay,
     )
@@ -269,7 +283,10 @@ def train(args: argparse.Namespace) -> None:
         and device.type == "cuda"
         and all(parameter.dtype != torch.float16 for parameter in trainable_params)
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=use_grad_scaler)
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=use_grad_scaler)
+    except (AttributeError, TypeError):
+        scaler = torch.cuda.amp.GradScaler(enabled=use_grad_scaler)
     optimizer.zero_grad(set_to_none=True)
 
     global_step = resumed_step
@@ -738,6 +755,7 @@ def _load_v5_checkpoint(
     lm: nn.Module,
     conditioner: BeatThisLogitConditioner,
     checkpoint: Path,
+    expected_initialization: str,
 ) -> int:
     try:
         state = torch.load(
@@ -747,6 +765,12 @@ def _load_v5_checkpoint(
         state = torch.load(str(checkpoint), map_location="cpu")
     if state.get("checkpoint_kind") != V5_CHECKPOINT_KIND:
         raise RuntimeError(f"Not a V5 Beat This checkpoint: {checkpoint}")
+    checkpoint_initialization = state.get("initialization", "v1")
+    if checkpoint_initialization != expected_initialization:
+        raise RuntimeError(
+            f"V5 checkpoint initialization {checkpoint_initialization!r} "
+            f"does not match requested {expected_initialization!r}."
+        )
     trainable = state.get("trainable")
     rhythm_state = state.get("rhythm_conditioner")
     if not isinstance(trainable, dict) or not isinstance(rhythm_state, dict):
@@ -817,6 +841,7 @@ def _save_checkpoint(
     torch.save(
         {
             "checkpoint_kind": V5_CHECKPOINT_KIND,
+            "initialization": args.init_from,
             "condition_schema": V5_CONDITION_SCHEMA,
             "detector": V5_DETECTOR,
             "tempo_estimator": V5_TEMPO_ESTIMATOR,
@@ -844,7 +869,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--valid-metadata", type=Path, default=None)
     parser.add_argument("--dataset-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--base-v1-checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--init-from",
+        choices=["v1", "pretrained"],
+        default="v1",
+        help=(
+            "Initialize from the project V1 checkpoint or directly from the "
+            "original pretrained MusicGen model. Default: v1."
+        ),
+    )
+    parser.add_argument("--base-v1-checkpoint", type=Path, default=None)
     parser.add_argument("--resume-v5-checkpoint", type=Path, default=None)
     parser.add_argument("--model", default="facebook/musicgen-melody-large")
     parser.add_argument("--device", default="cuda")
@@ -873,6 +907,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grad-accum-steps", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=8e-7)
+    parser.add_argument(
+        "--rhythm-lr",
+        type=float,
+        default=1e-4,
+        help="Learning rate for the new Beat This conditioner.",
+    )
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--amp", action="store_true")
@@ -883,6 +923,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rhythm-hidden-dim", type=int, default=256)
     parser.add_argument("--rhythm-dropout", type=float, default=0.1)
     parser.add_argument("--rhythm-feature-rate", type=float, default=50.0)
+    parser.add_argument("--seed", type=int, default=1337)
     return parser
 
 
@@ -890,10 +931,22 @@ def _validate_args(args: argparse.Namespace) -> None:
     for path, label in (
         (args.train_metadata, "train metadata"),
         (args.dataset_root, "dataset root"),
-        (args.base_v1_checkpoint, "V1 checkpoint"),
     ):
         if not path.exists():
             raise FileNotFoundError(f"{label} does not exist: {path}")
+    if args.init_from == "v1":
+        if args.base_v1_checkpoint is None:
+            raise ValueError(
+                "--base-v1-checkpoint is required with --init-from v1."
+            )
+        if not args.base_v1_checkpoint.is_file():
+            raise FileNotFoundError(
+                f"V1 checkpoint does not exist: {args.base_v1_checkpoint}"
+            )
+    elif args.base_v1_checkpoint is not None:
+        raise ValueError(
+            "Do not pass --base-v1-checkpoint with --init-from pretrained."
+        )
     if args.valid_metadata is not None and not args.valid_metadata.is_file():
         raise FileNotFoundError(
             f"valid metadata does not exist: {args.valid_metadata}"
@@ -908,6 +961,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Batch size and gradient accumulation must be > 0.")
     if args.max_steps is not None and args.max_steps <= 0:
         raise ValueError("--max-steps must be > 0 when provided.")
+    if args.lr <= 0 or args.rhythm_lr <= 0:
+        raise ValueError("LM and rhythm learning rates must be > 0.")
     if not 0.0 <= args.rhythm_dropout < 1.0:
         raise ValueError("--rhythm-dropout must be in [0, 1).")
 
