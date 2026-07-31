@@ -12,9 +12,10 @@ file per row, and creates canonical rhythm fields plus namespaced ``v5_*``
 fields in a new JSONL manifest. The V5 text prompt is built from the original
 V1 prompt and the BPM estimated by Beat This!.
 
-By default, Beat This! analyzes ``input_audio`` rather than ``target_audio``.
-This avoids target leakage and matches inference, where only the conditioning
-melody is available.
+By default, Beat This! analyzes ``target_audio`` (the clean instrumental) so
+the supervised V5 rhythm labels come from the complete backing track rather
+than the sparse melody piano. Use ``--analysis-audio input`` only for an
+explicit inference-side experiment.
 
 The condition file intentionally stores events rather than a V4-style feature
 grid. A future V5 trainer can choose its own event encoding without depending
@@ -32,6 +33,7 @@ Vast.ai example:
       --dataset-root "$DATASET_ROOT" \
       --output "$DATASET_ROOT/metadata_instrumental_v5_beatthis.jsonl" \
       --condition-root "$DATASET_ROOT/v5_beatthis" \
+      --analysis-audio target \
       --device cuda \
       --overwrite
 
@@ -48,9 +50,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DETECTOR_NAME = "beat_this"
 DEFAULT_CHECKPOINT = "final0"
+TEMPO_ESTIMATOR = "filtered_interval_mean_v1"
 LEGACY_RHYTHM_FIELDS = {
     "bpm",
     "bpm_raw",
@@ -62,6 +65,7 @@ LEGACY_RHYTHM_FIELDS = {
     "downbeat_count",
     "estimated_beats_per_bar",
     "tempo_relative_mad",
+    "tempo_estimator",
     "rhythm_condition",
     "rhythm_feature_rate",
     "beats_per_bar",
@@ -311,13 +315,40 @@ def _prepare_row(
 
     summary: dict[str, Any]
     if condition_path.exists() and not overwrite:
-        summary = _load_condition(condition_path)
+        cached_summary = _load_condition(condition_path)
         _validate_cached_condition(
-            summary=summary,
+            summary=cached_summary,
             audio_path=audio_path,
             analysis_audio=analysis_audio,
             checkpoint=checkpoint,
+            allow_schema_v1=True,
         )
+        if cached_summary["schema_version"] == 1:
+            # Schema 1 already contains the raw Beat This! events. Recompute
+            # tempo metadata with the less quantization-sensitive schema 2
+            # estimator and replace the cache without another model call.
+            summary = _summarize_events(
+                beats=cached_summary["beats"],
+                downbeats=cached_summary["downbeats"],
+                duration=float(cached_summary["duration"]),
+                bpm_min=bpm_min,
+                bpm_max=bpm_max,
+            )
+            _validate_summary(
+                summary=summary,
+                min_beats=min_beats,
+                min_downbeats=min_downbeats,
+                audio_path=audio_path,
+            )
+            _save_condition(
+                path=condition_path,
+                summary=summary,
+                audio_path=audio_path,
+                analysis_audio=analysis_audio,
+                checkpoint=checkpoint,
+            )
+        else:
+            summary = cached_summary
     elif audio_path in audio_cache:
         summary = dict(audio_cache[audio_path])
         _save_condition(
@@ -394,6 +425,7 @@ def _prepare_row(
         summary["estimated_beats_per_bar"]
     )
     updated["tempo_relative_mad"] = float(summary["tempo_relative_mad"])
+    updated["tempo_estimator"] = TEMPO_ESTIMATOR
 
     # Namespaced aliases make the V5 trainer contract explicit and prevent
     # accidental coupling to any older experimental trainer.
@@ -417,6 +449,7 @@ def _prepare_row(
         summary["estimated_beats_per_bar"]
     )
     updated["v5_tempo_relative_mad"] = float(summary["tempo_relative_mad"])
+    updated["v5_tempo_estimator"] = TEMPO_ESTIMATOR
 
     return {"row": updated, "summary": summary, "tracker": tracker}
 
@@ -478,8 +511,13 @@ def _summarize_events(
         raise RuntimeError("No valid beat intervals in the 30-400 BPM range.")
 
     filtered_intervals = _filter_interval_outliers(valid_intervals, np)
-    median_interval = float(np.median(filtered_intervals))
-    bpm_raw = 60.0 / median_interval
+    # Beat This! emits events on a 50 FPS grid. A median interval therefore
+    # snaps a true ~140 BPM pulse to either 0.42 s (142.86 BPM) or 0.44 s
+    # (136.36 BPM), depending on which quantized interval occurs once more in
+    # a chunk. The mean after robust outlier rejection recovers the underlying
+    # interval while still discarding missed/doubled beat gaps.
+    beat_interval = float(np.mean(filtered_intervals))
+    bpm_raw = 60.0 / beat_interval
     bpm, bpm_folded, bpm_in_range = _fold_bpm_to_range(
         bpm=bpm_raw,
         bpm_min=bpm_min,
@@ -487,12 +525,12 @@ def _summarize_events(
     )
 
     interval_mad = float(
-        np.median(np.abs(filtered_intervals - median_interval))
+        np.median(np.abs(filtered_intervals - beat_interval))
     )
-    tempo_relative_mad = interval_mad / median_interval
+    tempo_relative_mad = interval_mad / beat_interval
     estimated_beats_per_bar = _estimate_beats_per_bar(
         downbeats=downbeat_array,
-        median_beat_interval=median_interval,
+        beat_interval=beat_interval,
         np_module=np,
     )
 
@@ -504,7 +542,10 @@ def _summarize_events(
         "bpm_raw": float(bpm_raw),
         "bpm_folded": bool(bpm_folded),
         "bpm_in_range": bool(bpm_in_range),
-        "median_beat_interval": median_interval,
+        # Retain the schema-1 key for compatibility. In schema 2 it contains
+        # the robust interval estimate rather than the literal median.
+        "median_beat_interval": beat_interval,
+        "tempo_estimator": TEMPO_ESTIMATOR,
         "tempo_relative_mad": float(tempo_relative_mad),
         "first_beat": float(beat_array[0]),
         "first_downbeat": (
@@ -567,12 +608,12 @@ def _fold_bpm_to_range(
 
 def _estimate_beats_per_bar(
     downbeats: Any,
-    median_beat_interval: float,
+    beat_interval: float,
     np_module: Any,
 ) -> int:
-    if len(downbeats) < 2 or median_beat_interval <= 0:
+    if len(downbeats) < 2 or beat_interval <= 0:
         return 0
-    ratios = np_module.diff(downbeats) / median_beat_interval
+    ratios = np_module.diff(downbeats) / beat_interval
     ratios = ratios[np_module.isfinite(ratios)]
     ratios = ratios[(ratios >= 1.0) & (ratios <= 16.0)]
     if len(ratios) == 0:
@@ -622,6 +663,7 @@ def _save_condition(
             schema_version=np.asarray([SCHEMA_VERSION], dtype=np.int32),
             detector=np.asarray([DETECTOR_NAME]),
             detector_checkpoint=np.asarray([checkpoint]),
+            tempo_estimator=np.asarray([TEMPO_ESTIMATOR]),
             analysis_source=np.asarray([f"{analysis_audio}_audio"]),
             analysis_audio=np.asarray([str(audio_path)]),
             analysis_audio_size=np.asarray(
@@ -689,8 +731,15 @@ def _load_condition(path: Path) -> dict[str, Any]:
             raise RuntimeError(
                 f"Invalid V5 condition {path}; missing keys: {missing}"
             )
+        schema_version = int(data["schema_version"][0])
+        tempo_estimator = (
+            str(data["tempo_estimator"][0])
+            if "tempo_estimator" in data.files
+            else "interval_median_v1"
+        )
         return {
-            "schema_version": int(data["schema_version"][0]),
+            "schema_version": schema_version,
+            "tempo_estimator": tempo_estimator,
             "detector": str(data["detector"][0]),
             "detector_checkpoint": str(data["detector_checkpoint"][0]),
             "analysis_source": str(data["analysis_source"][0]),
@@ -723,11 +772,23 @@ def _validate_cached_condition(
     audio_path: Path,
     analysis_audio: str,
     checkpoint: str,
+    allow_schema_v1: bool = False,
 ) -> None:
-    if summary["schema_version"] != SCHEMA_VERSION:
+    accepted_schemas = {SCHEMA_VERSION}
+    if allow_schema_v1:
+        accepted_schemas.add(1)
+    if summary["schema_version"] not in accepted_schemas:
         raise RuntimeError(
             "Cached condition schema mismatch. Re-run with --overwrite: "
-            f"{summary['schema_version']} != {SCHEMA_VERSION}"
+            f"{summary['schema_version']} not in {sorted(accepted_schemas)}"
+        )
+    if (
+        summary["schema_version"] == SCHEMA_VERSION
+        and summary.get("tempo_estimator") != TEMPO_ESTIMATOR
+    ):
+        raise RuntimeError(
+            "Cached tempo estimator differs from the requested schema. "
+            "Re-run with --overwrite."
         )
     if summary["detector"] != DETECTOR_NAME:
         raise RuntimeError(
@@ -928,6 +989,8 @@ def _is_relative_to(path: Path, root: Path) -> bool:
 
 def _report_summary(summary: dict[str, Any]) -> dict[str, Any]:
     return {
+        "schema_version": SCHEMA_VERSION,
+        "tempo_estimator": TEMPO_ESTIMATOR,
         "bpm": float(summary["bpm"]),
         "bpm_raw": float(summary["bpm_raw"]),
         "bpm_folded": bool(summary["bpm_folded"]),
@@ -1028,10 +1091,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--analysis-audio",
         choices=("input", "target"),
-        default="input",
+        default="target",
         help=(
-            "Audio used for Beat This! analysis. Default: input, matching "
-            "inference and avoiding target leakage."
+            "Audio used for Beat This! analysis. Default: target, so V5 "
+            "training labels are extracted from the full instrumental."
         ),
     )
     parser.add_argument(
