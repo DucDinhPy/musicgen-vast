@@ -236,8 +236,6 @@ def _validate_cli(args: argparse.Namespace) -> None:
     _require_executable("fluidsynth")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError(f"CUDA requested ({args.device}) but CUDA is unavailable.")
-    if args.duration != "auto" and float(args.duration) <= 0:
-        raise ValueError("Duration must be positive or 'auto'.")
     if args.bpm_min <= 0 or args.bpm_max <= args.bpm_min:
         raise ValueError("BPM range must satisfy 0 < bpm-min < bpm-max.")
 
@@ -538,12 +536,14 @@ def _initial_generation_config(
     source_duration: float,
     beat_summary: dict[str, Any],
 ) -> dict[str, Any]:
-    duration = source_duration if args.duration == "auto" else float(args.duration)
     bpm = float(args.bpm) if args.bpm is not None else float(beat_summary["bpm"])
     return {
         "base_prompt": args.prompt,
         "bpm": bpm,
-        "duration": duration,
+        # Duration is deliberately locked to the original song. It is not an
+        # editable generation setting because the final background and remix
+        # must remain sample-aligned with the source vocal.
+        "duration": source_duration,
         "top_k": args.top_k,
         "top_p": args.top_p,
         "temperature": args.temperature,
@@ -620,9 +620,6 @@ def _review_config(
     print("Leave a field blank to keep its current value.")
     edited["base_prompt"] = _input_text("Prompt", str(edited["base_prompt"]))
     edited["bpm"] = _input_float("BPM", float(edited["bpm"]), minimum=1.0)
-    edited["duration"] = _input_float(
-        "Duration seconds", float(edited["duration"]), minimum=0.1
-    )
     edited["top_k"] = _input_int("Top-k", int(edited["top_k"]), minimum=0)
     edited["top_p"] = _input_float(
         "Top-p", float(edited["top_p"]), minimum=0.0, maximum=1.0
@@ -881,9 +878,31 @@ def _generate_v5(
         )
 
     audio = wav[0].detach().cpu().float().numpy().T
+    # AudioCraft generates discrete frames at 50 Hz, so decoding may differ
+    # from the requested duration by a few milliseconds. Pad/trim the decoded
+    # waveform to the exact requested sample count. Pipeline duration is
+    # locked to the original input song duration.
+    target_samples = int(round(duration * model.sample_rate))
+    audio = _pad_or_trim_numpy_audio(audio, target_samples)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(output_path), audio, model.sample_rate, subtype=args.subtype)
     print(f"Wrote generated background: {output_path}")
+
+
+def _pad_or_trim_numpy_audio(audio: Any, target_samples: int) -> Any:
+    import numpy as np
+
+    if target_samples <= 0:
+        raise ValueError("Target audio sample count must be positive.")
+    if audio.ndim == 1:
+        audio = audio[:, None]
+    if audio.shape[0] >= target_samples:
+        return audio[:target_samples]
+    padding = np.zeros(
+        (target_samples - audio.shape[0], audio.shape[1]),
+        dtype=audio.dtype,
+    )
+    return np.concatenate([audio, padding], axis=0)
 
 
 def _read_v5_checkpoint(path: Path) -> dict[str, Any]:
@@ -1228,11 +1247,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bpm", type=float, default=None)
 
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
-    parser.add_argument(
-        "--duration",
-        default="auto",
-        help="Seconds or 'auto' to match the original song. Default: auto.",
-    )
     parser.add_argument("--top-k", type=int, default=250)
     parser.add_argument("--top-p", type=float, default=0.0)
     parser.add_argument("--temperature", type=float, default=1.0)
