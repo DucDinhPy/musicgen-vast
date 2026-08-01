@@ -48,22 +48,37 @@ from prepare_musicgen_v5_beatthis_dataset import (
     _validate_summary,
 )
 from train_musicgen_v5_beatthis import (
+    LEGACY_CONDITIONER_ARCHITECTURE,
     RHYTHM_FEATURE_NAMES,
+    V51_RHYTHM_FEATURE_NAMES,
     V5_CHECKPOINT_KIND,
     V5_CONDITION_SCHEMA,
     V5_DETECTOR,
     V5_TEMPO_ESTIMATOR,
     BeatThisLogitConditioner,
+    V51AlignmentConditioner,
+    _build_conditioner,
     _events_to_features,
     _fit_feature_length,
     _infer_vocab_size,
+    _infer_num_codebooks,
     _load_condition_arrays,
     _load_v1_base_checkpoint,
 )
+from musicgen_v51_alignment import (
+    V51_CHECKPOINT_KIND,
+    V51_CONDITIONER_ARCHITECTURE,
+    VOCAL_TIMING_FEATURE_NAMES,
+    extract_vocal_timing_features,
+)
+from analyze_musicgen_beat_alignment import analyze_alignment, print_report
 
 
 DEFAULT_SEPARATOR_MODEL = (
     "roformer-model-bs-roformer-hyperace-v2-instrumental-by-pcunwa"
+)
+DEFAULT_VOCAL_SEPARATOR_MODEL = (
+    "roformer-model-bs-roformer-hyperace-v2-vocals-by-pcunwa"
 )
 DEFAULT_PROMPT = (
     "generate a full clean energetic vinahouse instrumental backing track, "
@@ -95,7 +110,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
     game_dir = work_dir / "game"
     condition_path = work_dir / "beatthis_instrumental_schema2.npz"
     generated_path = output_dir / f"{_safe_name(source_audio.stem)}_background_instrumental.wav"
+    generated_raw_path = work_dir / "generated_background_raw.wav"
     mixed_path = output_dir / f"{_safe_name(source_audio.stem)}_remix_with_vocal.wav"
+    alignment_report_path = output_dir / "beat_alignment_report.json"
 
     _guard_output_files((generated_path, mixed_path), args.overwrite)
     _validate_or_write_source_manifest(
@@ -168,6 +185,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
             "input_audio": str(source_audio),
             "checkpoint": str(args.checkpoint.resolve()),
             "separator_model": args.bs_model,
+            "vocal_separator_model": (
+                args.bs_vocal_model if args.use_dedicated_vocal_model else None
+            ),
             "beat_this_checkpoint": args.beatthis_checkpoint,
             "vocals": str(vocals_path),
             "reference_instrumental": str(reference_instrumental_path),
@@ -178,6 +198,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             "outputs": {
                 "background_instrumental": str(generated_path),
                 "background_instrumental_plus_vocal": str(mixed_path),
+                "beat_alignment_report": str(alignment_report_path),
             },
         },
     )
@@ -192,13 +213,41 @@ def run_pipeline(args: argparse.Namespace) -> None:
         selected_bpm=float(config["bpm"]),
     )
     _release_cuda()
+    generation_output_path = (
+        generated_raw_path
+        if args.beat_alignment in ("shift", "affine")
+        else generated_path
+    )
     _generate_v5(
         args=args,
         melody_path=melody_path,
+        timing_audio_path=vocals_path,
         condition=condition,
         config=config,
-        output_path=generated_path,
+        output_path=generation_output_path,
     )
+    if args.beat_alignment != "off":
+        try:
+            correction = (
+                args.beat_alignment
+                if args.beat_alignment in ("shift", "affine")
+                else "none"
+            )
+            alignment_report = analyze_alignment(
+                reference_audio=reference_instrumental_path,
+                generated_audio=generation_output_path,
+                checkpoint=args.beatthis_checkpoint,
+                device=args.beatthis_device,
+                extend_stride=float(config["extend_stride"]),
+                correction=correction,
+                corrected_output=(generated_path if correction != "none" else None),
+            )
+            _write_json(alignment_report_path, alignment_report)
+            print_report(alignment_report)
+        except Exception as exc:
+            if args.beat_alignment in ("shift", "affine"):
+                raise
+            print(f"[warn] Beat alignment analysis failed: {exc}")
     _mix_vocal_and_background(
         ffmpeg=args.ffmpeg,
         background_path=generated_path,
@@ -231,6 +280,8 @@ def _validate_cli(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"GAME Python does not exist: {args.game_python}")
     if not args.bs_python.exists():
         raise FileNotFoundError(f"BS-RoFormer Python does not exist: {args.bs_python}")
+    if args.use_dedicated_vocal_model and not args.bs_vocal_model.strip():
+        raise ValueError("--bs-vocal-model cannot be empty when enabled.")
     _require_executable(args.ffmpeg)
     _require_executable(args.ffprobe)
     _require_executable("fluidsynth")
@@ -300,44 +351,35 @@ def _separate_hyperace(
     separator_input_dir: Path,
     stems_dir: Path,
 ) -> tuple[Path, Path]:
-    vocal = _find_stem(stems_dir, "vocals")
-    instrumental = _find_stem(stems_dir, "instrumental")
-    if not args.reprocess and (vocal is not None or instrumental is not None):
-        reused = vocal or instrumental
-        print("Reusing available HyperACE stem:", reused)
-    else:
-        wrapper = Path(__file__).resolve().parent / "bs_roformer.py"
-        command = [
-            str(args.bs_python),
-            str(wrapper),
-            "separate",
-            "--input-dir",
-            str(separator_input_dir),
-            "--output-dir",
-            str(stems_dir),
-            "--model",
-            args.bs_model,
-            "--device",
-            args.bs_device,
-            "--convert-to-wav",
-            "--output-layout",
-            "organized",
-            "--limit",
-            "1",
-        ]
-        if args.bs_models_dir is not None:
-            command.extend(["--models-dir", str(args.bs_models_dir)])
-        if args.reprocess:
-            command.append("--overwrite-output")
-
-        env = dict(os.environ)
-        env["PATH"] = (
-            str(args.bs_python.parent) + os.pathsep + env.get("PATH", "")
-        )
-        print(f"Running BS-RoFormer HyperACE V2 ({args.bs_model})...")
-        _run(command, env=env)
-        vocal = _find_stem(stems_dir, "vocals")
+    instrumental_root = stems_dir / "instrumental_model"
+    vocal_root = stems_dir / "vocal_model"
+    # Read the old single-model cache as a fallback so existing output folders
+    # remain reusable after this two-model upgrade.
+    instrumental = _find_stem(instrumental_root, "instrumental")
+    if instrumental is None:
         instrumental = _find_stem(stems_dir, "instrumental")
+    if instrumental is None or args.reprocess:
+        _run_bs_separator_model(
+            args=args,
+            separator_input_dir=separator_input_dir,
+            output_dir=instrumental_root,
+            model_name=args.bs_model,
+        )
+        instrumental = _find_stem(instrumental_root, "instrumental")
+
+    vocal = None
+    if args.use_dedicated_vocal_model:
+        vocal = _find_stem(vocal_root, "vocals")
+        if vocal is None or args.reprocess:
+            _run_bs_separator_model(
+                args=args,
+                separator_input_dir=separator_input_dir,
+                output_dir=vocal_root,
+                model_name=args.bs_vocal_model,
+            )
+            vocal = _find_stem(vocal_root, "vocals")
+    if vocal is None:
+        vocal = _find_stem(stems_dir, "vocals")
 
     if vocal is None and instrumental is None:
         files = "\n".join(str(path) for path in sorted(stems_dir.rglob("*.wav")))
@@ -357,6 +399,41 @@ def _separate_hyperace(
         vocal = fallback_dir / "vocals.wav"
         _write_residual(staged_source, instrumental, vocal)
     return vocal.resolve(), instrumental.resolve()
+
+
+def _run_bs_separator_model(
+    args: argparse.Namespace,
+    separator_input_dir: Path,
+    output_dir: Path,
+    model_name: str,
+) -> None:
+    wrapper = Path(__file__).resolve().parent / "bs_roformer.py"
+    command = [
+        str(args.bs_python),
+        str(wrapper),
+        "separate",
+        "--input-dir",
+        str(separator_input_dir),
+        "--output-dir",
+        str(output_dir),
+        "--model",
+        model_name,
+        "--device",
+        args.bs_device,
+        "--convert-to-wav",
+        "--output-layout",
+        "organized",
+        "--limit",
+        "1",
+    ]
+    if args.bs_models_dir is not None:
+        command.extend(["--models-dir", str(args.bs_models_dir)])
+    if args.reprocess:
+        command.append("--overwrite-output")
+    env = dict(os.environ)
+    env["PATH"] = str(args.bs_python.parent) + os.pathsep + env.get("PATH", "")
+    print(f"Running BS-RoFormer ({model_name})...")
+    _run(command, env=env)
 
 
 def _find_stem(root: Path, name: str) -> Path | None:
@@ -596,6 +673,10 @@ def _print_processing_summary(
     print(f"source audio:          {source_audio}")
     print(f"separator:             BS-RoFormer HyperACE V2")
     print(f"separator model:       {args.bs_model}")
+    print(
+        "vocal separator model: "
+        f"{args.bs_vocal_model if args.use_dedicated_vocal_model else 'residual'}"
+    )
     print(f"vocals:                {vocals_path}")
     print(f"reference instrumental:{reference_instrumental_path}")
     print("melody process:        vocals -> GAME -> MIDI -> piano mono 32 kHz")
@@ -775,6 +856,7 @@ def _condition_for_features(
 def _generate_v5(
     args: argparse.Namespace,
     melody_path: Path,
+    timing_audio_path: Path,
     condition: dict[str, Any],
     config: dict[str, Any],
     output_path: Path,
@@ -817,10 +899,23 @@ def _generate_v5(
 
     hidden_dim = _checkpoint_hidden_dim(checkpoint_state)
     vocab_size = _infer_vocab_size(model)
-    conditioner = BeatThisLogitConditioner(
-        input_dim=len(RHYTHM_FEATURE_NAMES),
+    num_codebooks = _infer_num_codebooks(model)
+    architecture = str(
+        checkpoint_state.get(
+            "conditioner_architecture", LEGACY_CONDITIONER_ARCHITECTURE
+        )
+    )
+    feature_names = (
+        V51_RHYTHM_FEATURE_NAMES
+        if architecture == V51_CONDITIONER_ARCHITECTURE
+        else RHYTHM_FEATURE_NAMES
+    )
+    conditioner = _build_conditioner(
+        architecture=architecture,
+        input_dim=len(feature_names),
         hidden_dim=hidden_dim,
         vocab_size=vocab_size,
+        num_codebooks=num_codebooks,
         dropout=0.0,
     ).to(device)
     missing, unexpected = model.lm.load_state_dict(
@@ -837,6 +932,7 @@ def _generate_v5(
     print(f"Global step:          {int(checkpoint_state.get('global_step', 0))}")
     print(f"V5 LM keys:           {len(checkpoint_state['trainable'])}")
     print(f"Missing/unexpected:   {len(missing)}/{len(unexpected)}")
+    print(f"Conditioner:          {architecture}")
     print(f"Rhythm hidden dim:    {hidden_dim}")
 
     melody, melody_sr = _load_wav(melody_path, sf)
@@ -847,11 +943,36 @@ def _generate_v5(
     feature_rate = float(
         checkpoint_state.get("args", {}).get("rhythm_feature_rate", 50.0)
     )
-    features = _events_to_features(
+    beat_features = _events_to_features(
         condition=condition,
         duration=duration,
         feature_rate=feature_rate,
     )
+    if architecture == V51_CONDITIONER_ARCHITECTURE:
+        import numpy as np
+
+        timing_source = str(
+            checkpoint_state.get("v51_timing_audio_field") or "source_vocal"
+        )
+        selected_timing_audio = (
+            melody_path if timing_source == "input_audio" else timing_audio_path
+        )
+        timing_features = extract_vocal_timing_features(
+            selected_timing_audio,
+            duration=duration,
+            feature_rate=feature_rate,
+        )
+        features = np.concatenate(
+            [beat_features, timing_features], axis=1
+        ).astype(np.float32, copy=False)
+        print(
+            "V5.1 timing features: "
+            + ", ".join(VOCAL_TIMING_FEATURE_NAMES)
+        )
+        print(f"V5.1 timing source:   {timing_source}")
+        print(f"V5.1 timing audio:    {selected_timing_audio}")
+    else:
+        features = beat_features
     rhythm = torch.from_numpy(features).unsqueeze(0).to(device)
     total_frames = int(duration * model.frame_rate)
     rhythm = _fit_feature_length(rhythm, total_frames)
@@ -929,18 +1050,27 @@ def _read_v5_checkpoint(path: Path) -> dict[str, Any]:
         state = torch.load(str(path), map_location="cpu")
     if not isinstance(state, dict):
         raise RuntimeError(f"Invalid checkpoint object: {path}")
-    if state.get("checkpoint_kind") != V5_CHECKPOINT_KIND:
-        raise RuntimeError(f"Not a V5 Beat This checkpoint: {path}")
+    checkpoint_kind = state.get("checkpoint_kind")
+    if checkpoint_kind not in (V5_CHECKPOINT_KIND, V51_CHECKPOINT_KIND):
+        raise RuntimeError(f"Not a V5/V5.1 Beat This checkpoint: {path}")
     if int(state.get("condition_schema", -1)) != V5_CONDITION_SCHEMA:
         raise RuntimeError("V5 checkpoint condition schema mismatch.")
     if state.get("detector") != V5_DETECTOR:
         raise RuntimeError("V5 checkpoint detector mismatch.")
     if state.get("tempo_estimator") != V5_TEMPO_ESTIMATOR:
         raise RuntimeError("V5 checkpoint tempo estimator mismatch.")
+    architecture = str(
+        state.get("conditioner_architecture", LEGACY_CONDITIONER_ARCHITECTURE)
+    )
+    expected_names = (
+        V51_RHYTHM_FEATURE_NAMES
+        if architecture == V51_CONDITIONER_ARCHITECTURE
+        else RHYTHM_FEATURE_NAMES
+    )
     names = tuple(state.get("rhythm_feature_names", ()))
-    if names != tuple(RHYTHM_FEATURE_NAMES):
+    if names != tuple(expected_names):
         raise RuntimeError(
-            f"V5 rhythm feature mismatch: {names} != {RHYTHM_FEATURE_NAMES}"
+            f"V5 rhythm feature mismatch: {names} != {expected_names}"
         )
     if not isinstance(state.get("trainable"), dict):
         raise RuntimeError("V5 checkpoint has no LM trainable state.")
@@ -953,31 +1083,42 @@ def _checkpoint_hidden_dim(state: dict[str, Any]) -> int:
     args = state.get("args")
     if isinstance(args, dict) and args.get("rhythm_hidden_dim"):
         return int(args["rhythm_hidden_dim"])
-    weight = state["rhythm_conditioner"].get("temporal.0.weight")
+    architecture = str(
+        state.get("conditioner_architecture", LEGACY_CONDITIONER_ARCHITECTURE)
+    )
+    weight_key = (
+        "base.0.weight"
+        if architecture == V51_CONDITIONER_ARCHITECTURE
+        else "temporal.0.weight"
+    )
+    weight = state["rhythm_conditioner"].get(weight_key)
     if not isinstance(weight, torch.Tensor) or weight.ndim != 3:
         raise RuntimeError("Cannot infer rhythm hidden dimension from checkpoint.")
     return int(weight.shape[0])
 
 
 def _precompute_rhythm_bias(
-    conditioner: BeatThisLogitConditioner,
+    conditioner: torch.nn.Module,
     rhythm: torch.Tensor,
     vocab_size: int,
     device: torch.device,
     amp: bool,
 ) -> torch.Tensor:
-    zeros = torch.zeros(
-        (rhythm.shape[0], 1, rhythm.shape[1], vocab_size),
-        dtype=rhythm.dtype,
-        device=device,
-    )
     with torch.no_grad(), torch.autocast(
         device_type=device.type,
         dtype=torch.float16,
         enabled=amp and device.type == "cuda",
     ):
-        bias = conditioner(rhythm, zeros)
-    return bias[:, 0].detach()
+        if isinstance(conditioner, V51AlignmentConditioner):
+            bias = conditioner.compute_bias(rhythm, rhythm.shape[1])
+        else:
+            zeros = torch.zeros(
+                (rhythm.shape[0], 1, rhythm.shape[1], vocab_size),
+                dtype=rhythm.dtype,
+                device=device,
+            )
+            bias = conditioner(rhythm, zeros)
+    return bias.detach()
 
 
 @contextlib.contextmanager
@@ -1053,9 +1194,15 @@ def _patched_v5_autoregressive_conditioning(
         logits = logits.clone()
         for coord in pattern.layout[active_step]:
             global_t = int(state["segment_offset"]) + int(coord.t)
-            if global_t < 0 or global_t >= rhythm_bias.shape[1]:
+            if global_t < 0 or global_t >= rhythm_bias.shape[2]:
                 continue
-            bias = rhythm_bias[:, global_t, :].to(
+            bias_codebook = 0 if rhythm_bias.shape[1] == 1 else int(coord.q)
+            if bias_codebook >= rhythm_bias.shape[1]:
+                raise RuntimeError(
+                    f"Rhythm bias has {rhythm_bias.shape[1]} codebooks but "
+                    f"generation requested codebook {coord.q}."
+                )
+            bias = rhythm_bias[:, bias_codebook, global_t, :].to(
                 device=logits.device, dtype=logits.dtype
             )
             if bias.shape[0] == 1 and logits.shape[0] != 1:
@@ -1234,6 +1381,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("/workspace/.venv-bs-roformer/bin/python"),
     )
     parser.add_argument("--bs-model", default=DEFAULT_SEPARATOR_MODEL)
+    parser.add_argument(
+        "--bs-vocal-model", default=DEFAULT_VOCAL_SEPARATOR_MODEL
+    )
+    parser.add_argument(
+        "--use-dedicated-vocal-model",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Run the HyperACE V2 vocals checkpoint for melody extraction. "
+            "Disable to derive vocal as source minus instrumental."
+        ),
+    )
     parser.add_argument("--bs-device", default="cuda")
     parser.add_argument("--bs-models-dir", type=Path, default=None)
 
@@ -1259,6 +1418,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--beatthis-checkpoint", default=DEFAULT_BEATTHIS_CHECKPOINT
     )
     parser.add_argument("--beatthis-device", default="cuda")
+    parser.add_argument(
+        "--beat-alignment",
+        choices=["off", "report", "shift", "affine"],
+        default="report",
+        help=(
+            "Analyze generated beats against the reference instrumental. "
+            "shift corrects constant latency; affine also corrects linear "
+            "tempo drift with librosa. Default: report only."
+        ),
+    )
     parser.add_argument("--bpm-min", type=float, default=120.0)
     parser.add_argument("--bpm-max", type=float, default=150.0)
     parser.add_argument("--bpm", type=float, default=None)

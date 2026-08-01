@@ -32,6 +32,13 @@ from train_musicgen_melody_paired import (
     _resolve_path,
     _set_trainable,
 )
+from musicgen_v51_alignment import (
+    V51_CHECKPOINT_KIND,
+    V51_CONDITIONER_ARCHITECTURE,
+    V51_SCHEMA_VERSION,
+    VOCAL_TIMING_FEATURE_NAMES,
+    load_vocal_timing_condition,
+)
 
 
 V5_CHECKPOINT_KIND = "musicgen_v5_beatthis"
@@ -49,6 +56,8 @@ RHYTHM_FEATURE_NAMES = (
     "tempo_confidence",
     "downbeat_reliable",
 )
+LEGACY_CONDITIONER_ARCHITECTURE = "legacy"
+V51_RHYTHM_FEATURE_NAMES = RHYTHM_FEATURE_NAMES + VOCAL_TIMING_FEATURE_NAMES
 
 
 class BeatThisLogitConditioner(nn.Module):
@@ -108,12 +117,119 @@ class BeatThisLogitConditioner(nn.Module):
         return logits + bias
 
 
+class _DilatedResidualBlock(nn.Module):
+    """Long-context temporal block initialized as an exact identity."""
+
+    def __init__(self, hidden_dim: int, dilation: int, dropout: float):
+        super().__init__()
+        self.dilated = nn.Conv1d(
+            hidden_dim,
+            hidden_dim,
+            kernel_size=3,
+            padding=dilation,
+            dilation=dilation,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.projection = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1)
+        nn.init.zeros_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        residual = self.dilated(values)
+        residual = F.silu(residual)
+        residual = self.dropout(residual)
+        return values + self.projection(residual)
+
+
+class V51AlignmentConditioner(nn.Module):
+    """Long-context, per-codebook rhythm and vocal timing conditioner.
+
+    The legacy two-convolution front end is retained so an existing V5
+    conditioner can be migrated without discarding its learned behavior.
+    Seven dilated residual blocks expand the receptive field to roughly ten
+    seconds at 50 Hz, while a separate vocabulary bias is learned for every
+    EnCodec codebook.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        vocab_size: int,
+        num_codebooks: int,
+        dropout: float,
+    ):
+        super().__init__()
+        if min(input_dim, hidden_dim, vocab_size, num_codebooks) <= 0:
+            raise ValueError("Conditioner dimensions must be positive.")
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.vocab_size = vocab_size
+        self.num_codebooks = num_codebooks
+        self.base = nn.Sequential(
+            nn.Conv1d(input_dim, hidden_dim, kernel_size=5, padding=2),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.SiLU(),
+        )
+        self.context = nn.ModuleList(
+            _DilatedResidualBlock(hidden_dim, dilation, dropout)
+            for dilation in (2, 4, 8, 16, 32, 64, 128)
+        )
+        self.output = nn.Linear(
+            hidden_dim, num_codebooks * vocab_size
+        )
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def compute_bias(self, rhythm: torch.Tensor, time_steps: int) -> torch.Tensor:
+        if rhythm.ndim != 3 or rhythm.shape[-1] != self.input_dim:
+            raise RuntimeError(
+                f"Expected rhythm [B,T,{self.input_dim}], got {tuple(rhythm.shape)}"
+            )
+        rhythm = _fit_feature_length(rhythm, time_steps)
+        hidden = self.base(rhythm.transpose(1, 2))
+        for block in self.context:
+            hidden = block(hidden)
+        bias = self.output(hidden.transpose(1, 2))
+        batch, frames, _ = bias.shape
+        return bias.view(
+            batch, frames, self.num_codebooks, self.vocab_size
+        ).permute(0, 2, 1, 3).contiguous()
+
+    def forward(
+        self,
+        rhythm: torch.Tensor,
+        logits: torch.Tensor,
+    ) -> torch.Tensor:
+        if logits.ndim != 4:
+            raise RuntimeError(
+                f"Expected logits [B,K,T,V], got {tuple(logits.shape)}"
+            )
+        if logits.shape[1] != self.num_codebooks:
+            raise RuntimeError(
+                f"Expected {self.num_codebooks} codebooks, got {logits.shape[1]}"
+            )
+        if logits.shape[-1] != self.vocab_size:
+            raise RuntimeError(
+                f"Expected vocabulary {self.vocab_size}, got {logits.shape[-1]}"
+            )
+        return logits + self.compute_bias(rhythm, logits.shape[2])
+
+
 class V5PairDataset(Dataset):
-    def __init__(self, rows: list[dict[str, Any]], dataset_root: Path):
+    def __init__(
+        self,
+        rows: list[dict[str, Any]],
+        dataset_root: Path,
+        conditioner_architecture: str = LEGACY_CONDITIONER_ARCHITECTURE,
+    ):
         if not rows:
             raise RuntimeError("V5 dataset has no rows.")
         self.rows = rows
         self.dataset_root = dataset_root
+        self.conditioner_architecture = conditioner_architecture
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -146,7 +262,7 @@ class V5PairDataset(Dataset):
             raise ValueError(
                 f"V5 row {index} was not analyzed from target_audio."
             )
-        return {
+        item = {
             "input_audio": _resolve_path(
                 row["input_audio"], self.dataset_root
             ),
@@ -161,6 +277,29 @@ class V5PairDataset(Dataset):
             "track_id": str(row.get("track_id", "")),
             "chunk_index": int(row.get("chunk_index", -1)),
         }
+        if self.conditioner_architecture == V51_CONDITIONER_ARCHITECTURE:
+            required_v51 = {
+                "v51_schema_version",
+                "v51_timing_condition",
+                "v51_timing_feature_rate",
+            }
+            missing_v51 = sorted(required_v51.difference(row))
+            if missing_v51:
+                raise KeyError(
+                    f"V5.1 row {index} is missing fields: {missing_v51}"
+                )
+            if int(row["v51_schema_version"]) != V51_SCHEMA_VERSION:
+                raise ValueError(
+                    f"V5.1 row {index} schema is "
+                    f"{row['v51_schema_version']}, expected {V51_SCHEMA_VERSION}."
+                )
+            item["v51_timing_condition"] = _resolve_path(
+                row["v51_timing_condition"], self.dataset_root
+            )
+            item["v51_timing_feature_rate"] = float(
+                row["v51_timing_feature_rate"]
+            )
+        return item
 
 
 def train(args: argparse.Namespace) -> None:
@@ -199,10 +338,14 @@ def train(args: argparse.Namespace) -> None:
         )
 
     vocab_size = _infer_vocab_size(model)
-    conditioner = BeatThisLogitConditioner(
-        input_dim=len(RHYTHM_FEATURE_NAMES),
+    num_codebooks = _infer_num_codebooks(model)
+    feature_names = _feature_names(args.conditioner_architecture)
+    conditioner = _build_conditioner(
+        architecture=args.conditioner_architecture,
+        input_dim=len(feature_names),
         hidden_dim=args.rhythm_hidden_dim,
         vocab_size=vocab_size,
+        num_codebooks=num_codebooks,
         dropout=args.rhythm_dropout,
     ).to(device)
 
@@ -213,6 +356,7 @@ def train(args: argparse.Namespace) -> None:
             conditioner=conditioner,
             checkpoint=args.resume_v5_checkpoint,
             expected_initialization=args.init_from,
+            expected_architecture=args.conditioner_architecture,
         )
 
     lm_trainable = [
@@ -233,6 +377,10 @@ def train(args: argparse.Namespace) -> None:
     if args.max_valid_rows is not None:
         valid_rows = valid_rows[: args.max_valid_rows]
     _assert_disjoint_tracks(train_rows, valid_rows)
+    if args.conditioner_architecture == V51_CONDITIONER_ARCHITECTURE:
+        args.v51_timing_audio_field = _validate_v51_timing_sources(
+            train_rows, valid_rows
+        )
 
     print(f"Model sample rate:       {model.sample_rate}")
     print(f"Model channels:          {model.audio_channels}")
@@ -240,7 +388,9 @@ def train(args: argparse.Namespace) -> None:
     print(f"LM trainable tensors:    {len(trainable_names)}")
     print(f"LM trainable params:     {sum(p.numel() for p in lm_trainable):,}")
     print(f"LM learning rate:        {args.lr}")
-    print(f"Rhythm features:         {len(RHYTHM_FEATURE_NAMES)}")
+    print(f"Conditioner architecture: {args.conditioner_architecture}")
+    print(f"Rhythm features:         {len(feature_names)}")
+    print(f"EnCodec codebooks:       {num_codebooks}")
     print(f"Rhythm hidden dim:       {args.rhythm_hidden_dim}")
     print(f"Rhythm feature rate:     {args.rhythm_feature_rate}")
     print(
@@ -251,6 +401,8 @@ def train(args: argparse.Namespace) -> None:
     print(f"Train rows:              {len(train_rows)}")
     print(f"Valid rows:              {len(valid_rows)}")
     print(f"Resumed V5 step:         {resumed_step}")
+    if args.conditioner_architecture == V51_CONDITIONER_ARCHITECTURE:
+        print(f"V5.1 timing source:      {args.v51_timing_audio_field}")
 
     train_loader = _loader(
         rows=train_rows,
@@ -389,7 +541,11 @@ def _loader(
     shuffle: bool,
 ) -> DataLoader:
     return DataLoader(
-        V5PairDataset(rows, args.dataset_root),
+        V5PairDataset(
+            rows,
+            args.dataset_root,
+            conditioner_architecture=args.conditioner_architecture,
+        ),
         batch_size=args.batch_size,
         shuffle=shuffle,
         num_workers=args.num_workers,
@@ -399,6 +555,7 @@ def _loader(
             channels=model.audio_channels,
             audio_duration=args.audio_duration,
             feature_rate=args.rhythm_feature_rate,
+            conditioner_architecture=args.conditioner_architecture,
             convert_audio_fn=convert_audio_fn,
         ),
     )
@@ -410,6 +567,7 @@ def _collate(
     channels: int,
     audio_duration: float,
     feature_rate: float,
+    conditioner_architecture: str,
     convert_audio_fn: Any,
 ) -> dict[str, Any]:
     import numpy as np
@@ -439,15 +597,28 @@ def _collate(
                 condition_path=item["rhythm_condition"],
                 metadata_bpm=item["bpm"],
             )
-        rhythms.append(
-            torch.from_numpy(
-                _events_to_features(
-                    condition=condition,
-                    duration=audio_duration,
-                    feature_rate=feature_rate,
-                )
-            )
+        beat_features = _events_to_features(
+            condition=condition,
+            duration=audio_duration,
+            feature_rate=feature_rate,
         )
+        if conditioner_architecture == V51_CONDITIONER_ARCHITECTURE:
+            timing_rate = float(item["v51_timing_feature_rate"])
+            if abs(timing_rate - feature_rate) > 1e-4:
+                raise RuntimeError(
+                    f"V5.1 timing rate {timing_rate} != trainer rate {feature_rate}"
+                )
+            timing_features = load_vocal_timing_condition(
+                item["v51_timing_condition"],
+                expected_rate=feature_rate,
+                expected_duration=audio_duration,
+            )
+            combined = np.concatenate(
+                [beat_features, timing_features], axis=1
+            ).astype(np.float32, copy=False)
+        else:
+            combined = beat_features
+        rhythms.append(torch.from_numpy(combined))
         texts.append(item["text"])
         metadata.append(
             {
@@ -645,7 +816,7 @@ def _fit_feature_length(
 
 def _training_step(
     model: Any,
-    conditioner: BeatThisLogitConditioner,
+    conditioner: nn.Module,
     batch: dict[str, Any],
     device: torch.device,
     amp: bool,
@@ -679,7 +850,7 @@ def _training_step(
 @torch.no_grad()
 def _evaluate(
     model: Any,
-    conditioner: BeatThisLogitConditioner,
+    conditioner: nn.Module,
     loader: DataLoader,
     device: torch.device,
     amp: bool,
@@ -734,6 +905,92 @@ def _infer_vocab_size(model: Any) -> int:
     raise RuntimeError("Could not infer MusicGen LM vocabulary size.")
 
 
+def _infer_num_codebooks(model: Any) -> int:
+    if hasattr(model.lm, "linears") and len(model.lm.linears) > 0:
+        return int(len(model.lm.linears))
+    if hasattr(model.compression_model, "num_codebooks"):
+        return int(model.compression_model.num_codebooks)
+    raise RuntimeError("Could not infer the number of MusicGen codebooks.")
+
+
+def _feature_names(architecture: str) -> tuple[str, ...]:
+    if architecture == LEGACY_CONDITIONER_ARCHITECTURE:
+        return RHYTHM_FEATURE_NAMES
+    if architecture == V51_CONDITIONER_ARCHITECTURE:
+        return V51_RHYTHM_FEATURE_NAMES
+    raise ValueError(f"Unsupported conditioner architecture: {architecture}")
+
+
+def _build_conditioner(
+    architecture: str,
+    input_dim: int,
+    hidden_dim: int,
+    vocab_size: int,
+    num_codebooks: int,
+    dropout: float,
+) -> nn.Module:
+    if architecture == LEGACY_CONDITIONER_ARCHITECTURE:
+        return BeatThisLogitConditioner(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            vocab_size=vocab_size,
+            dropout=dropout,
+        )
+    if architecture == V51_CONDITIONER_ARCHITECTURE:
+        return V51AlignmentConditioner(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            vocab_size=vocab_size,
+            num_codebooks=num_codebooks,
+            dropout=dropout,
+        )
+    raise ValueError(f"Unsupported conditioner architecture: {architecture}")
+
+
+def _migrate_legacy_conditioner(
+    conditioner: V51AlignmentConditioner,
+    legacy_state: dict[str, torch.Tensor],
+) -> None:
+    required = {
+        "temporal.0.weight",
+        "temporal.0.bias",
+        "temporal.3.weight",
+        "temporal.3.bias",
+        "output.weight",
+        "output.bias",
+    }
+    missing = sorted(required.difference(legacy_state))
+    if missing:
+        raise RuntimeError(f"Legacy conditioner is missing keys: {missing}")
+    with torch.no_grad():
+        old_input_weight = legacy_state["temporal.0.weight"]
+        old_input_bias = legacy_state["temporal.0.bias"]
+        if old_input_weight.shape[1] > conditioner.base[0].weight.shape[1]:
+            raise RuntimeError("Legacy conditioner has more input features than V5.1")
+        conditioner.base[0].weight.zero_()
+        conditioner.base[0].weight[:, : old_input_weight.shape[1]].copy_(
+            old_input_weight
+        )
+        conditioner.base[0].bias.copy_(old_input_bias)
+        conditioner.base[3].weight.copy_(legacy_state["temporal.3.weight"])
+        conditioner.base[3].bias.copy_(legacy_state["temporal.3.bias"])
+
+        old_output_weight = legacy_state["output.weight"]
+        old_output_bias = legacy_state["output.bias"]
+        expected_rows = conditioner.vocab_size
+        if old_output_weight.shape[0] != expected_rows:
+            raise RuntimeError(
+                f"Legacy vocabulary {old_output_weight.shape[0]} != "
+                f"V5.1 vocabulary {expected_rows}"
+            )
+        conditioner.output.weight.copy_(
+            old_output_weight.repeat(conditioner.num_codebooks, 1)
+        )
+        conditioner.output.bias.copy_(
+            old_output_bias.repeat(conditioner.num_codebooks)
+        )
+
+
 def _assert_disjoint_tracks(
     train_rows: list[dict[str, Any]],
     valid_rows: list[dict[str, Any]],
@@ -751,11 +1008,29 @@ def _assert_disjoint_tracks(
         )
 
 
+def _validate_v51_timing_sources(
+    train_rows: list[dict[str, Any]],
+    valid_rows: list[dict[str, Any]],
+) -> str:
+    fields = {
+        str(row.get("v51_timing_audio_field", ""))
+        for row in train_rows + valid_rows
+    }
+    if "" in fields:
+        raise ValueError("Every V5.1 row must have v51_timing_audio_field.")
+    if len(fields) != 1:
+        raise ValueError(
+            f"V5.1 train/valid rows mix timing audio sources: {sorted(fields)}"
+        )
+    return next(iter(fields))
+
+
 def _load_v5_checkpoint(
     lm: nn.Module,
-    conditioner: BeatThisLogitConditioner,
+    conditioner: nn.Module,
     checkpoint: Path,
     expected_initialization: str,
+    expected_architecture: str,
 ) -> int:
     try:
         state = torch.load(
@@ -763,8 +1038,9 @@ def _load_v5_checkpoint(
         )
     except TypeError:
         state = torch.load(str(checkpoint), map_location="cpu")
-    if state.get("checkpoint_kind") != V5_CHECKPOINT_KIND:
-        raise RuntimeError(f"Not a V5 Beat This checkpoint: {checkpoint}")
+    checkpoint_kind = state.get("checkpoint_kind")
+    if checkpoint_kind not in (V5_CHECKPOINT_KIND, V51_CHECKPOINT_KIND):
+        raise RuntimeError(f"Not a V5/V5.1 checkpoint: {checkpoint}")
     checkpoint_initialization = state.get("initialization", "v1")
     if checkpoint_initialization != expected_initialization:
         raise RuntimeError(
@@ -776,7 +1052,29 @@ def _load_v5_checkpoint(
     if not isinstance(trainable, dict) or not isinstance(rhythm_state, dict):
         raise RuntimeError(f"Incomplete V5 checkpoint: {checkpoint}")
     missing, unexpected = lm.load_state_dict(trainable, strict=False)
-    conditioner.load_state_dict(rhythm_state, strict=True)
+    checkpoint_architecture = str(
+        state.get("conditioner_architecture", LEGACY_CONDITIONER_ARCHITECTURE)
+    )
+    if checkpoint_architecture == expected_architecture:
+        conditioner.load_state_dict(rhythm_state, strict=True)
+    elif (
+        checkpoint_architecture == LEGACY_CONDITIONER_ARCHITECTURE
+        and expected_architecture == V51_CONDITIONER_ARCHITECTURE
+        and isinstance(conditioner, V51AlignmentConditioner)
+    ):
+        _migrate_legacy_conditioner(
+            conditioner=conditioner,
+            legacy_state=rhythm_state,
+        )
+        print(
+            "Upgraded legacy V5 conditioner to V5.1: retained the learned "
+            "front end and replicated its output bias per codebook."
+        )
+    else:
+        raise RuntimeError(
+            f"Checkpoint conditioner {checkpoint_architecture!r} does not "
+            f"match requested {expected_architecture!r}."
+        )
     global_step = int(state.get("global_step", 0))
     print(f"Resumed V5 checkpoint: {checkpoint}")
     print(
@@ -826,7 +1124,7 @@ def _load_v1_base_checkpoint(
 def _save_checkpoint(
     path: Path,
     model: Any,
-    conditioner: BeatThisLogitConditioner,
+    conditioner: nn.Module,
     model_name: str,
     trainable_names: list[str],
     global_step: int,
@@ -838,14 +1136,25 @@ def _save_checkpoint(
         for name in trainable_names
         if name in lm_state
     }
+    architecture = args.conditioner_architecture
+    feature_names = _feature_names(architecture)
+    checkpoint_kind = (
+        V51_CHECKPOINT_KIND
+        if architecture == V51_CONDITIONER_ARCHITECTURE
+        else V5_CHECKPOINT_KIND
+    )
     torch.save(
         {
-            "checkpoint_kind": V5_CHECKPOINT_KIND,
+            "checkpoint_kind": checkpoint_kind,
+            "conditioner_architecture": architecture,
             "initialization": args.init_from,
             "condition_schema": V5_CONDITION_SCHEMA,
             "detector": V5_DETECTOR,
             "tempo_estimator": V5_TEMPO_ESTIMATOR,
-            "rhythm_feature_names": RHYTHM_FEATURE_NAMES,
+            "rhythm_feature_names": feature_names,
+            "v51_timing_audio_field": getattr(
+                args, "v51_timing_audio_field", None
+            ),
             "model_name": model_name,
             "global_step": global_step,
             "trainable": trainable,
@@ -880,6 +1189,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--base-v1-checkpoint", type=Path, default=None)
     parser.add_argument("--resume-v5-checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--conditioner-architecture",
+        choices=[LEGACY_CONDITIONER_ARCHITECTURE, V51_CONDITIONER_ARCHITECTURE],
+        default=LEGACY_CONDITIONER_ARCHITECTURE,
+        help=(
+            "legacy keeps the original 9-feature shared-codebook conditioner; "
+            "alignment_v1 enables V5.1 long-context per-codebook conditioning "
+            "and requires metadata prepared by "
+            "prepare_musicgen_v51_alignment_dataset.py."
+        ),
+    )
     parser.add_argument("--model", default="facebook/musicgen-melody-large")
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
