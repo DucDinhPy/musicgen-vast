@@ -300,43 +300,45 @@ def _separate_hyperace(
     separator_input_dir: Path,
     stems_dir: Path,
 ) -> tuple[Path, Path]:
-    existing_vocal = _find_stem(stems_dir, "vocals")
-    existing_instrumental = _find_stem(stems_dir, "instrumental")
-    if existing_vocal and existing_instrumental and not args.reprocess:
-        print("Reusing HyperACE stems:", existing_vocal.parent)
-        return existing_vocal, existing_instrumental
-
-    wrapper = Path(__file__).resolve().parent / "bs_roformer.py"
-    command = [
-        str(args.bs_python),
-        str(wrapper),
-        "separate",
-        "--input-dir",
-        str(separator_input_dir),
-        "--output-dir",
-        str(stems_dir),
-        "--model",
-        args.bs_model,
-        "--device",
-        args.bs_device,
-        "--convert-to-wav",
-        "--output-layout",
-        "organized",
-        "--limit",
-        "1",
-    ]
-    if args.bs_models_dir is not None:
-        command.extend(["--models-dir", str(args.bs_models_dir)])
-    if args.reprocess:
-        command.append("--overwrite-output")
-
-    env = dict(os.environ)
-    env["PATH"] = str(args.bs_python.parent) + os.pathsep + env.get("PATH", "")
-    print(f"Running BS-RoFormer HyperACE V2 ({args.bs_model})...")
-    _run(command, env=env)
-
     vocal = _find_stem(stems_dir, "vocals")
     instrumental = _find_stem(stems_dir, "instrumental")
+    if not args.reprocess and (vocal is not None or instrumental is not None):
+        reused = vocal or instrumental
+        print("Reusing available HyperACE stem:", reused)
+    else:
+        wrapper = Path(__file__).resolve().parent / "bs_roformer.py"
+        command = [
+            str(args.bs_python),
+            str(wrapper),
+            "separate",
+            "--input-dir",
+            str(separator_input_dir),
+            "--output-dir",
+            str(stems_dir),
+            "--model",
+            args.bs_model,
+            "--device",
+            args.bs_device,
+            "--convert-to-wav",
+            "--output-layout",
+            "organized",
+            "--limit",
+            "1",
+        ]
+        if args.bs_models_dir is not None:
+            command.extend(["--models-dir", str(args.bs_models_dir)])
+        if args.reprocess:
+            command.append("--overwrite-output")
+
+        env = dict(os.environ)
+        env["PATH"] = (
+            str(args.bs_python.parent) + os.pathsep + env.get("PATH", "")
+        )
+        print(f"Running BS-RoFormer HyperACE V2 ({args.bs_model})...")
+        _run(command, env=env)
+        vocal = _find_stem(stems_dir, "vocals")
+        instrumental = _find_stem(stems_dir, "instrumental")
+
     if vocal is None and instrumental is None:
         files = "\n".join(str(path) for path in sorted(stems_dir.rglob("*.wav")))
         raise RuntimeError(
@@ -360,13 +362,28 @@ def _separate_hyperace(
 def _find_stem(root: Path, name: str) -> Path | None:
     if not root.exists():
         return None
-    exact = sorted(path for path in root.rglob(f"{name}.wav") if path.is_file())
+    aliases = {
+        "instrumental": (
+            "instrumental",
+            "instrument",
+            "accompaniment",
+            "no_vocals",
+        ),
+        "vocals": ("vocals", "vocal"),
+    }.get(name, (name,))
+    exact = sorted(
+        path
+        for alias in aliases
+        for path in root.rglob(f"{alias}.wav")
+        if path.is_file()
+    )
     if exact:
         return exact[0]
     fuzzy = sorted(
         path
         for path in root.rglob("*.wav")
-        if path.is_file() and name in path.stem.lower()
+        if path.is_file()
+        and any(alias in path.stem.lower() for alias in aliases)
     )
     return fuzzy[0] if len(fuzzy) == 1 else None
 
